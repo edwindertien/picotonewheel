@@ -1,56 +1,62 @@
 // ============================================================
-//  main.cpp  –  Step 3b: Polyphonic MIDI organ
+//  main.cpp  –  Step 4: 9-drawbar tonewheel organ
 //
-//  Up to MAX_VOICES (16) simultaneous notes.
-//  Organ behaviour: same note can't re-trigger while held.
-//
-//  MIDI input: USB-MIDI (class-compliant) + UART on GP5
+//  Each key plays up to 9 harmonic partials simultaneously,
+//  weighted by the 9 drawbar levels.
+//  Drawbars controlled via MIDI CC 12-20.
 //
 //  Serial commands:
-//    info   -> active voice list
-//    pio    -> PIO diagnostics
-//    all    -> panic: silence all voices
-//    <hz>   -> force single tone (bypasses MIDI)
-//    0      -> silence
+//    info         -> voice + drawbar state
+//    pio          -> PIO diagnostics
+//    all          -> panic (all notes off)
+//    db 888000000 -> set drawbars (9 digits, 0-8 each)
+//    pre full     -> preset: full organ
+//    pre jazz     -> preset: jazz
+//    pre flute    -> preset: flute
 // ============================================================
 
 #include <Arduino.h>
 #include "config.h"
 #include "wavetable.h"
 #include "oscillator.h"
-#include "voice_manager.h"
+#include "tonewheel_manager.h"
 #include "audio_driver.h"
 #include "midi_handler.h"
 
 int16_t sineTable[WAVETABLE_SIZE];
 
-VoiceManager voices;
+TonewheelManager organ;
 
 void handleSerial();
 void printInfo();
 
 // ---- MIDI callbacks ----------------------------------------
 
-void midi_note_on(uint8_t note, uint8_t velocity)
-{
-    voices.noteOn(note, velocity);
+void midi_note_on(uint8_t note, uint8_t velocity) {
+    organ.noteOn(note, velocity);
     Serial.print("ON  n="); Serial.print(note);
-    Serial.print(" v=");    Serial.print(velocity);
-    Serial.print(" [");     Serial.print(voices.activeCount());
-    Serial.println(" voices]");
+    Serial.print(" ["); Serial.print(organ.activeCount());
+    Serial.println("]");
 }
 
-void midi_note_off(uint8_t note)
-{
-    voices.noteOff(note);
+void midi_note_off(uint8_t note) {
+    organ.noteOff(note);
     Serial.print("OFF n="); Serial.print(note);
-    Serial.print(" [");     Serial.print(voices.activeCount());
-    Serial.println(" voices]");
+    Serial.print(" ["); Serial.print(organ.activeCount());
+    Serial.println("]");
 }
 
-void midi_pitch_bend(int16_t bend)
-{
-    voices.setPitchBend(bend);
+void midi_pitch_bend(int16_t bend) {
+    organ.setPitchBend(bend);
+}
+
+void midi_cc(uint8_t cc, uint8_t value) {
+    if (organ.handleCC(cc, value)) {
+        Serial.print("DB CC"); Serial.print(cc);
+        Serial.print("="); Serial.print(value);
+        Serial.print("  ");
+        organ.drawbars.debugPrint();
+    }
 }
 
 // ============================================================
@@ -66,15 +72,15 @@ void setup()
     delay(200);
 
     Serial.println();
-    Serial.println("=== Tonewheel Organ – Step 3b: Polyphony ===");
-    Serial.print("Max voices: "); Serial.println(MAX_VOICES);
+    Serial.println("=== Tonewheel Organ – Step 4: Drawbars ===");
 
     wavetable_init();
-    voices.init();
+    organ.init();
     audio_driver_init(SAMPLE_RATE);
 
     audio_driver_debug();
-    Serial.println("Commands: info | pio | all | <freq_hz> | 0");
+    organ.drawbars.debugPrint();
+    Serial.println("Commands: info | all | db <9digits> | pre full/jazz/flute");
     digitalWrite(LED_PIN, HIGH);
 }
 
@@ -85,7 +91,7 @@ void loop()
     handleSerial();
 
     for (int i = 0; i < BUFFER_FRAMES; i++) {
-        int16_t s = voices.tick();
+        int16_t s = organ.tick();
         audio_driver_put(s, s);
     }
 }
@@ -104,22 +110,28 @@ void handleSerial()
                 } else if (line == "pio") {
                     audio_driver_debug();
                 } else if (line == "all") {
-                    // MIDI panic
-                    for (int n = 0; n < 128; n++) voices.noteOff(n);
+                    organ.allNotesOff();
                     Serial.println("All notes off.");
-                } else {
-                    float freq = line.toFloat();
-                    if (freq <= 0.0f) {
-                        for (int n = 0; n < 128; n++) voices.noteOff(n);
-                        Serial.println("Silence");
-                    } else {
-                        // Force a single tone via MIDI note 69 (A4=440)
-                        // mapped to requested freq by direct osc access
-                        for (int n = 0; n < 128; n++) voices.noteOff(n);
-                        voices.noteOn(69, 100);
-                        Serial.print("Force -> "); Serial.print(freq, 2);
-                        Serial.println(" Hz (use MIDI for exact pitch)");
+                } else if (line.startsWith("db ") && line.length() == 12) {
+                    // "db 888000000"
+                    String db = line.substring(3);
+                    for (int i = 0; i < NUM_DRAWBARS; i++) {
+                        uint8_t v = db[i] - '0';
+                        if (v <= 8) organ.drawbars.level[i] = v;
                     }
+                    // Propagate to active voices
+                    organ.propagateDrawbars();
+                    Serial.print("Drawbars set: ");
+                    organ.drawbars.debugPrint();
+                } else if (line == "pre full") {
+                    organ.drawbars.presetFullOrgan();
+                    Serial.println("Preset: full organ");
+                } else if (line == "pre jazz") {
+                    organ.drawbars.presetJazz();
+                    Serial.println("Preset: jazz");
+                } else if (line == "pre flute") {
+                    organ.drawbars.presetFlute();
+                    Serial.println("Preset: flute");
                 }
             }
             line = "";
@@ -129,9 +141,8 @@ void handleSerial()
     }
 }
 
-void printInfo()
-{
-    Serial.println("--- Voice state ---");
-    voices.debugPrint();
+void printInfo() {
+    Serial.println("--- Organ state ---");
+    organ.debugPrint();
     Serial.println("-------------------");
 }
