@@ -1,0 +1,73 @@
+;
+; Waveshare Pico-Audio Rev 2.1 – I2S stereo output
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+; SPDX-License-Identifier: BSD-3-Clause
+;
+; 16-bit stereo. Autopull 32 bits, MSB first.
+; FIFO word: | 31..16 left | 15..0 right |
+;
+; Pins:
+;   out/set pin  = AUDIO_DATA_PIN  (GP22, DIN)
+;   side-set [3] = AUDIO_CLOCK_PIN_BASE (GP26=MCLK, GP27=LRCK, GP28=SCLK)
+;
+; side bits: bit2=MCLK  bit1=LRCK  bit0=SCLK
+
+.program audio_pio
+.side_set 3
+
+bitloop1:
+    nop               side 0b110   ; MCLK=1 LRCK=1 SCLK=0
+    out pins, 1       side 0b100   ; MCLK=1 LRCK=0 SCLK=0  shift data
+    nop               side 0b110
+    jmp x-- bitloop1  side 0b100
+    set x, 15         side 0b110
+
+bitloop0:
+    out pins, 1       side 0b000   ; MCLK=0 LRCK=0 SCLK=0
+    nop               side 0b001   ; MCLK=0 LRCK=0 SCLK=1
+    nop               side 0b000
+    jmp x-- bitloop0  side 0b001
+    out pins, 1       side 0b100
+    nop               side 0b110
+
+public entry_point:
+    set x, 14         side 0b100
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void audio_pio_init(PIO pio, uint sm, uint offset,
+                                  uint data_pin, uint clock_pin_base,
+                                  uint32_t sample_freq)
+{
+    // Pin directions
+    pio_gpio_init(pio, data_pin);
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+    pio_gpio_init(pio, clock_pin_base + 2);
+
+    pio_sm_config c = audio_pio_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, data_pin, 1);
+    sm_config_set_set_pins(&c, data_pin, 1);
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+    sm_config_set_out_shift(&c, false, true, 32);  // MSB-first, autopull 32
+
+    // Clock divider  (Waveshare formula)
+    uint32_t sys_clk = clock_get_hz(clk_sys);
+    uint32_t div     = (uint32_t)(((uint64_t)sys_clk * 2) /
+                                  ((uint64_t)sample_freq * 256));
+    sm_config_set_clkdiv_int_frac(&c, div >> 8u, div & 0xffu);
+
+    pio_sm_init(pio, sm, offset, &c);  // loads config including clkdiv
+
+    // Pin directions (must come after pio_sm_init)
+    uint pin_mask = (1u << data_pin) | (7u << clock_pin_base);
+    pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+    pio_sm_set_pins(pio, sm, 0);
+
+    // Jump to entry_point then enable
+    pio_sm_exec(pio, sm,
+                pio_encode_jmp(offset + audio_pio_offset_entry_point));
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
