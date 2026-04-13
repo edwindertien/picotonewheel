@@ -3,35 +3,46 @@
 ; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
 ; SPDX-License-Identifier: BSD-3-Clause
 ;
-; 16-bit stereo. Autopull 32 bits, MSB first.
-; FIFO word: | 31..16 left | 15..0 right |
+; Original Waveshare program, restored verbatim.
 ;
-; Pins:
-;   out/set pin  = AUDIO_DATA_PIN  (GP22, DIN)
-;   side-set [3] = AUDIO_CLOCK_PIN_BASE (GP26=MCLK, GP27=LRCK, GP28=SCLK)
+; Actual pin mapping (decoded from side-set values):
+;   clock_pin_base+0 = GP26 = BCK  (bit clock, driven by side-set bit0)
+;   clock_pin_base+1 = GP27 = LRCK (word select, driven by side-set bit1)
+;   GP28 is always 0 (not used by this program)
+;   GP22 = DIN (data)
 ;
-; side bits: bit2=MCLK  bit1=LRCK  bit0=SCLK
+; MCLK: the CS4344 derives MCLK from the BCK rate internally via its PLL.
+; GP26 (BCK) also serves as MCLK reference. GP28 can be left floating.
+;
+; side-set: bit1=LRCK  bit0=BCK
+;   0b11 = LRCK=1 BCK=1  (bitloop1, right channel)
+;   0b10 = LRCK=1 BCK=0
+;   0b01 = LRCK=0 BCK=1  (bitloop0, left channel)
+;   0b00 = LRCK=0 BCK=0
+;
+; Autopull 32 bits, MSB first.
+; FIFO word: | 31..16 sample ws=0 | 15..0 sample ws=1 |
 
 .program audio_pio
-.side_set 3
+.side_set 2
 
 bitloop1:
-    nop               side 0b110   ; MCLK=1 LRCK=1 SCLK=0
-    out pins, 1       side 0b100   ; MCLK=1 LRCK=0 SCLK=0  shift data
-    nop               side 0b110
-    jmp x-- bitloop1  side 0b100
-    set x, 15         side 0b110
+    nop               side 0b11
+    out pins, 1       side 0b10
+    nop               side 0b11
+    jmp x-- bitloop1  side 0b10
+    set x, 15         side 0b11
 
 bitloop0:
-    out pins, 1       side 0b000   ; MCLK=0 LRCK=0 SCLK=0
-    nop               side 0b001   ; MCLK=0 LRCK=0 SCLK=1
-    nop               side 0b000
-    jmp x-- bitloop0  side 0b001
-    out pins, 1       side 0b100
-    nop               side 0b110
+    out pins, 1       side 0b00
+    nop               side 0b01
+    nop               side 0b00
+    jmp x-- bitloop0  side 0b01
+    out pins, 1       side 0b10
+    nop               side 0b11
 
 public entry_point:
-    set x, 14         side 0b100
+    set x, 14         side 0b10
 
 % c-sdk {
 #include "hardware/clocks.h"
@@ -40,32 +51,31 @@ static inline void audio_pio_init(PIO pio, uint sm, uint offset,
                                   uint data_pin, uint clock_pin_base,
                                   uint32_t sample_freq)
 {
-    // Pin directions
     pio_gpio_init(pio, data_pin);
-    pio_gpio_init(pio, clock_pin_base);
-    pio_gpio_init(pio, clock_pin_base + 1);
-    pio_gpio_init(pio, clock_pin_base + 2);
+    pio_gpio_init(pio, clock_pin_base);        // GP26 = BCK
+    pio_gpio_init(pio, clock_pin_base + 1);    // GP27 = LRCK
+    // GP28 not driven by PIO — set as regular output, held low (don't care)
 
     pio_sm_config c = audio_pio_program_get_default_config(offset);
     sm_config_set_out_pins(&c, data_pin, 1);
     sm_config_set_set_pins(&c, data_pin, 1);
-    sm_config_set_sideset_pins(&c, clock_pin_base);
-    sm_config_set_out_shift(&c, false, true, 32);  // MSB-first, autopull 32
+    sm_config_set_sideset_pins(&c, clock_pin_base);  // base=GP26
+    sm_config_set_out_shift(&c, false, true, 32);    // MSB-first, autopull 32
 
-    // Clock divider  (Waveshare formula)
+    // clkdiv = sys_clk / (128 × sample_freq)
+    // Original program has 128 instructions per frame, BCK = 64×fs
+    // At 133 MHz / 44100 Hz: clkdiv=23.56, BCK=2,822,400 Hz ✓
     uint32_t sys_clk = clock_get_hz(clk_sys);
-    uint32_t div     = (uint32_t)(((uint64_t)sys_clk * 2) /
-                                  ((uint64_t)sample_freq * 256));
-    sm_config_set_clkdiv_int_frac(&c, div >> 8u, div & 0xffu);
+    float    clkdiv  = (float)sys_clk / (128.0f * (float)sample_freq);
+    sm_config_set_clkdiv(&c, clkdiv);
 
-    pio_sm_init(pio, sm, offset, &c);  // loads config including clkdiv
+    pio_sm_init(pio, sm, offset, &c);
 
-    // Pin directions (must come after pio_sm_init)
-    uint pin_mask = (1u << data_pin) | (7u << clock_pin_base);
+    // Only GP22 and GP26/27 are PIO outputs
+    uint pin_mask = (1u << data_pin) | (3u << clock_pin_base);  // 3=0b11, 2 pins
     pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
     pio_sm_set_pins(pio, sm, 0);
 
-    // Jump to entry_point then enable
     pio_sm_exec(pio, sm,
                 pio_encode_jmp(offset + audio_pio_offset_entry_point));
     pio_sm_set_enabled(pio, sm, true);

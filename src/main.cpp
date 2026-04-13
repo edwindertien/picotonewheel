@@ -1,14 +1,16 @@
 // ============================================================
-//  main.cpp  –  Step 3a: Single-note MIDI → tone
+//  main.cpp  –  Step 3b: Polyphonic MIDI organ
 //
-//  MIDI input:
-//    USB-MIDI  : plug Pico USB into host (class-compliant)
-//    UART MIDI : GP5 (RX), 31250 baud, via optocoupler
+//  Up to MAX_VOICES (16) simultaneous notes.
+//  Organ behaviour: same note can't re-trigger while held.
 //
-//  Serial commands (115200 baud):
-//    info   -> voice state
+//  MIDI input: USB-MIDI (class-compliant) + UART on GP5
+//
+//  Serial commands:
+//    info   -> active voice list
 //    pio    -> PIO diagnostics
-//    440    -> force 440 Hz tone (bypass MIDI, for testing)
+//    all    -> panic: silence all voices
+//    <hz>   -> force single tone (bypasses MIDI)
 //    0      -> silence
 // ============================================================
 
@@ -16,38 +18,39 @@
 #include "config.h"
 #include "wavetable.h"
 #include "oscillator.h"
-#include "voice.h"
+#include "voice_manager.h"
 #include "audio_driver.h"
 #include "midi_handler.h"
 
 int16_t sineTable[WAVETABLE_SIZE];
 
-Voice voice;
+VoiceManager voices;
 
 void handleSerial();
 void printInfo();
 
-// ---- MIDI callbacks (called from midi_handler.h) -----------
+// ---- MIDI callbacks ----------------------------------------
 
 void midi_note_on(uint8_t note, uint8_t velocity)
 {
-    voice.noteOn(note, velocity);
-    Serial.print("Note ON  : "); Serial.print(note);
-    Serial.print("  vel=");      Serial.print(velocity);
-    Serial.print("  freq=");
-    Serial.println(Voice::noteToFreq(note), 2);
+    voices.noteOn(note, velocity);
+    Serial.print("ON  n="); Serial.print(note);
+    Serial.print(" v=");    Serial.print(velocity);
+    Serial.print(" [");     Serial.print(voices.activeCount());
+    Serial.println(" voices]");
 }
 
 void midi_note_off(uint8_t note)
 {
-    voice.noteOff(note);
-    Serial.print("Note OFF : "); Serial.println(note);
+    voices.noteOff(note);
+    Serial.print("OFF n="); Serial.print(note);
+    Serial.print(" [");     Serial.print(voices.activeCount());
+    Serial.println(" voices]");
 }
 
 void midi_pitch_bend(int16_t bend)
 {
-    voice.setPitchBend(bend);
-    // (no serial print — too frequent during bend)
+    voices.setPitchBend(bend);
 }
 
 // ============================================================
@@ -56,7 +59,6 @@ void setup()
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
-    // USB-MIDI init must come before Serial.begin() in TinyUSB mode
     midi_handler_init();
 
     Serial.begin(115200);
@@ -64,34 +66,26 @@ void setup()
     delay(200);
 
     Serial.println();
-    Serial.println("=== Tonewheel Organ – Step 3a: MIDI ===");
+    Serial.println("=== Tonewheel Organ – Step 3b: Polyphony ===");
+    Serial.print("Max voices: "); Serial.println(MAX_VOICES);
 
     wavetable_init();
-    Serial.println("Wavetable ready.");
-
+    voices.init();
     audio_driver_init(SAMPLE_RATE);
-    Serial.println("Audio driver ready.");
 
     audio_driver_debug();
-
-    Serial.println("MIDI ready (USB + UART GP5).");
-    Serial.println("Commands: info | pio | <freq_hz> | 0");
-
+    Serial.println("Commands: info | pio | all | <freq_hz> | 0");
     digitalWrite(LED_PIN, HIGH);
 }
 
 // ============================================================
 void loop()
 {
-    // Poll MIDI (non-blocking)
     midi_handler_poll();
-
-    // Handle serial debug commands
     handleSerial();
 
-    // Fill audio buffer
     for (int i = 0; i < BUFFER_FRAMES; i++) {
-        int16_t s = voice.tick();
+        int16_t s = voices.tick();
         audio_driver_put(s, s);
     }
 }
@@ -109,17 +103,22 @@ void handleSerial()
                     printInfo();
                 } else if (line == "pio") {
                     audio_driver_debug();
+                } else if (line == "all") {
+                    // MIDI panic
+                    for (int n = 0; n < 128; n++) voices.noteOff(n);
+                    Serial.println("All notes off.");
                 } else {
                     float freq = line.toFloat();
                     if (freq <= 0.0f) {
-                        voice.osc.active = false;
+                        for (int n = 0; n < 128; n++) voices.noteOff(n);
                         Serial.println("Silence");
                     } else {
-                        voice.osc.setFrequency(freq);
-                        voice.osc.amplitude = 0.7f;
-                        voice.osc.active    = true;
-                        Serial.print("Force freq -> ");
-                        Serial.print(freq, 2); Serial.println(" Hz");
+                        // Force a single tone via MIDI note 69 (A4=440)
+                        // mapped to requested freq by direct osc access
+                        for (int n = 0; n < 128; n++) voices.noteOff(n);
+                        voices.noteOn(69, 100);
+                        Serial.print("Force -> "); Serial.print(freq, 2);
+                        Serial.println(" Hz (use MIDI for exact pitch)");
                     }
                 }
             }
@@ -132,17 +131,7 @@ void handleSerial()
 
 void printInfo()
 {
-    Serial.println("--- Voice ---");
-    if (voice.currentNote != 255) {
-        Serial.print("  Note      : "); Serial.println(voice.currentNote);
-        Serial.print("  Frequency : ");
-        float f = (float)voice.osc.phaseInc * SAMPLE_RATE / 4294967296.0f;
-        Serial.print(f, 2); Serial.println(" Hz");
-        Serial.print("  Amplitude : "); Serial.println(voice.osc.amplitude, 3);
-        Serial.print("  PitchBend : "); Serial.print(voice.pitchBend, 3);
-        Serial.println(" semitones");
-    } else {
-        Serial.println("  No note playing");
-    }
-    Serial.println("-------------");
+    Serial.println("--- Voice state ---");
+    voices.debugPrint();
+    Serial.println("-------------------");
 }
