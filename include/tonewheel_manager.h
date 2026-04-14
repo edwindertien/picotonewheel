@@ -89,9 +89,12 @@ public:
         for (int i = 0; i < MAX_TW_VOICES; i++) {
             mix += _voices[i].tick();
         }
-        // Each voice is pre-scaled by /10; sum of MAX_TW_VOICES voices
-        // could reach 16 × 3276 = 52,416. Divide by 2 for final headroom.
-        return (int16_t)(mix >> 1);
+        // Each voice outputs max ±(32767 * 256 >> 8) / 10 = ±3276
+        // 16 voices × 3276 = 52,416 — divide by 2 still clips at full polyphony.
+        // Divide by 3 instead: 52416/3 = 17472, safely within int16.
+        // In practice players rarely hold 16 notes at full drawbars;
+        // a master volume CC will be added to fine-tune later.
+        return (int16_t)(mix / 3);
     }
 
     uint8_t activeCount()  const { return _activeCount; }

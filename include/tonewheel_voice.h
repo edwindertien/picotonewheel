@@ -83,15 +83,13 @@ private:
         float rootFreq = _baseFreq * powf(2.0f, pitchBend / 12.0f);
         for (int i = 0; i < NUM_DRAWBARS; i++) {
             float freq = rootFreq * DRAWBAR_MULT[i];
-            // Clamp to Nyquist (22050 Hz) — upper partials of high notes
-            // would alias; silence them instead
             if (freq >= 22000.0f) {
-                _osc[i].active    = false;
-                _osc[i].amplitude = 0.0f;
+                _osc[i].active = false;
+                _osc[i].setAmplitude(0.0f);
             } else {
                 _osc[i].setFrequency(freq);
-                _osc[i].amplitude = db.amplitude(i);
-                _osc[i].active    = (db.level[i] > 0);
+                _osc[i].setAmplitude(db.amplitude(i));
+                _osc[i].active = (db.level[i] > 0);
             }
         }
     }
