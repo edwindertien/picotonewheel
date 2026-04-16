@@ -14,12 +14,15 @@
 // ============================================================
 
 #include <Arduino.h>
+#include "config.h"
 
 #define NUM_DRAWBARS  9
 
-// MIDI CC numbers for the 9 drawbars (customise if needed)
+// MIDI CC numbers — all defined in config.h, referenced here
 static const uint8_t DRAWBAR_CC[NUM_DRAWBARS] = {
-    12, 13, 14, 15, 16, 17, 18, 19, 20
+    MIDI_CC_DRAWBAR_1, MIDI_CC_DRAWBAR_2, MIDI_CC_DRAWBAR_3,
+    MIDI_CC_DRAWBAR_4, MIDI_CC_DRAWBAR_5, MIDI_CC_DRAWBAR_6,
+    MIDI_CC_DRAWBAR_7, MIDI_CC_DRAWBAR_8, MIDI_CC_DRAWBAR_9
 };
 
 // Harmonic multipliers for each drawbar (frequency = note_freq × mult)

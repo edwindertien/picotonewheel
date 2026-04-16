@@ -1,20 +1,22 @@
 #pragma once
 // ============================================================
-//  click.h  –  Hammond key click
-//  Integer-only hot path — no float in tick()
-//  CC 84: click level 0..127
+//  click.h  —  Key click  (Pico 2 version)
+//  Float envelope — free on RP2350 FPU
 // ============================================================
 
-#include <Arduino.h>
+#include "config.h"
 
-#define CLICK_CC_LEVEL  84
+#define CLICK_CC_LEVEL  MIDI_CC_CLICK
+
+// Decay: ~5ms burst. exp(-1/(0.005*44100)) ≈ 0.9955
+static const float CLICK_DECAY = 0.9955f;
 
 class Click {
 public:
     uint8_t level = 40;
 
-    void init()    { _envI = 0; }
-    void trigger() { if (level > 0) _envI = 65535u; }
+    void init()    { _env = 0.0f; }
+    void trigger() { if (level > 0) _env = 1.0f; }
 
     bool handleCC(uint8_t cc, uint8_t value) {
         if (cc == CLICK_CC_LEVEL) {
@@ -24,19 +26,14 @@ public:
         return false;
     }
 
-    // Integer-only tick: LCG noise × decaying envelope
     inline int16_t tick() {
-        if (_envI == 0) return 0;
-        // Decay: 0.9887 in 16.16 fixed point = 64790
-        _envI = (uint32_t)((uint64_t)_envI * 64790u >> 16);
-        if (_envI < 64) { _envI = 0; return 0; }
+        if (_env < 0.002f) { _env = 0.0f; return 0; }
         _rng = _rng * 1664525u + 1013904223u;
         int16_t noise = (int16_t)(_rng >> 16);
-        // (noise * level) >> 8 scales to ±32767 range
-        int32_t out = ((int32_t)noise * level) >> 8;
-        // Apply envelope: envI is 0..65535, shift to 0..255
-        out = (out * (int32_t)(_envI >> 8)) >> 8;
-        return (int16_t)out;
+        // FPU: float multiply is single-cycle
+        int16_t out = (int16_t)(noise * (level / 255.0f) * _env);
+        _env *= CLICK_DECAY;
+        return out;
     }
 
     void debugPrint() const {
@@ -44,6 +41,6 @@ public:
     }
 
 private:
-    uint32_t _envI = 0;
-    uint32_t _rng  = 0xDEADBEEFu;
+    float    _env = 0.0f;
+    uint32_t _rng = 0xDEADBEEFu;
 };

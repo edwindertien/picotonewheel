@@ -1,62 +1,55 @@
 #pragma once
 // ============================================================
-//  config.h  —  Single place for all configuration
+//  config.h  —  Pico 2 (RP2350) optimised build
+//  Overclock: 200 MHz  |  Voices: 16  |  Wavetable: 4096 pts
 // ============================================================
 
-// ---- Feature flags (1=on, 0=off) ---------------------------
-#define ENABLE_LCD      1   // Waveshare Pico-LCD-1.14
-#define ENABLE_SERIAL   1   // Serial debug + command interface
+// ---- Feature flags -----------------------------------------
+#define ENABLE_LCD      1
+#define ENABLE_SERIAL   1
+
+// ---- Polyphony ---------------------------------------------
+// RP2350 @ 200 MHz with HW divide + FPU handles 16 comfortably.
+// Raise to 20 if you overclock to 250 MHz.
+#define MAX_ACTIVE_VOICES  16
 
 // ---- MIDI --------------------------------------------------
-#define MIDI_CHANNEL    0   // 0=OMNI, 1-16=specific channel
+#define MIDI_CHANNEL    0   // 0=OMNI
 
-// Drawbar CCs (standard Korg/Roland drawbar controller)
-#define MIDI_CC_DRAWBAR_1   12
-#define MIDI_CC_DRAWBAR_2   13
-#define MIDI_CC_DRAWBAR_3   14
-#define MIDI_CC_DRAWBAR_4   15
-#define MIDI_CC_DRAWBAR_5   16
-#define MIDI_CC_DRAWBAR_6   17
-#define MIDI_CC_DRAWBAR_7   18
-#define MIDI_CC_DRAWBAR_8   19
-#define MIDI_CC_DRAWBAR_9   20
+#define MIDI_CC_DRAWBAR_1   70
+#define MIDI_CC_DRAWBAR_2   71
+#define MIDI_CC_DRAWBAR_3   72
+#define MIDI_CC_DRAWBAR_4   73
+#define MIDI_CC_DRAWBAR_5   74
+#define MIDI_CC_DRAWBAR_6   75
+#define MIDI_CC_DRAWBAR_7   76
+#define MIDI_CC_DRAWBAR_8   77
+#define MIDI_CC_DRAWBAR_9   78
 
-// Percussion CCs
-#define MIDI_CC_PERC_ONOFF      80   // >=64=on
-#define MIDI_CC_PERC_HARMONIC   81   // >=64=3rd
-#define MIDI_CC_PERC_DECAY      82   // >=64=fast
-#define MIDI_CC_PERC_LEVEL      83   // >=64=soft
-
-// Click CC
+#define MIDI_CC_PERC_ONOFF      80
+#define MIDI_CC_PERC_HARMONIC   81
+#define MIDI_CC_PERC_DECAY      82
+#define MIDI_CC_PERC_LEVEL      83
 #define MIDI_CC_CLICK           84
-
-// Volume CC
 #define MIDI_CC_VOLUME           7
 
-// Set to a note number to toggle percussion via that note, or -1 to disable
 #define MIDI_NOTE_PERC_TOGGLE   -1
-
-// Program Change preset select (0=Full, 1=Jazz, 2=Flute, 3=Off)
 #define MIDI_PROGCHANGE_PRESETS  1
 
-// ---- Polyphony cap -----------------------------------------
-// Maximum simultaneous voices before oldest is stolen.
-// Raise for Pico 2, lower for more stability.
-// Rule of thumb: (CPU_MHz / 133) * 8 is a safe starting point.
-//   Pico  (RP2040, 133MHz): 8
-//   Pico 2 (RP2350, 150MHz): 12
-#define MAX_ACTIVE_VOICES   12
+// ---- I2S pins (Waveshare Pico-Audio Rev 2.1) ---------------
 #define AUDIO_DATA_PIN        22
-#define AUDIO_CLOCK_PIN_BASE  26   // BCK=GP26, LRCK=GP27
+#define AUDIO_CLOCK_PIN_BASE  26
 
-// ---- Audio parameters --------------------------------------
+// ---- Audio -------------------------------------------------
 #define SAMPLE_RATE    44100
 #define BUFFER_FRAMES  256
 
-// ---- Wavetable ---------------------------------------------
-#define WAVETABLE_BITS 10
-#define WAVETABLE_SIZE (1 << WAVETABLE_BITS)
-#define PHASE_SHIFT    (32 - WAVETABLE_BITS)
+// ---- Wavetable — 4096 points for Pico 2 -------------------
+// SFDR improves from ~60 dB (1024 pts) to ~72 dB (4096 pts)
+// Memory cost: 4096 × 2 = 8 KB (vs 2 KB) — trivial on 520 KB SRAM
+#define WAVETABLE_BITS 12
+#define WAVETABLE_SIZE (1 << WAVETABLE_BITS)   // 4096
+#define PHASE_SHIFT    (32 - WAVETABLE_BITS)   // 20
 
 // ---- Misc --------------------------------------------------
-#define LED_PIN        25
+#define LED_PIN  25

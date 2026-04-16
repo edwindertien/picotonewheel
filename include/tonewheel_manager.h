@@ -1,17 +1,17 @@
 #pragma once
 // ============================================================
-//  tonewheel_manager.h  —  Polyphonic tonewheel voice manager
+//  tonewheel_manager.h  —  Pico 2 optimised
 //
-//  Fixes vs v7:
-//  1. Polyphony cap (MAX_ACTIVE_VOICES) — graceful degradation
-//     instead of collapse. Oldest voice stolen at cap.
-//  2. Hardware spinlock — non-blocking in tick() (try-lock),
-//     blocking in noteOn/noteOff (MIDI rate, can wait).
-//     Prevents the data race that caused half-note detune glitch.
-//  3. tick() uses int64 intermediate for the /3 scaling so it
-//     never overflows regardless of voice count or bar setting.
-//  4. Percussion only ticks when enabled; cached drawbarSum
-//     avoids repeated calls to drawbarSum() in hot path.
+//  RP2350 Cortex-M33 has:
+//    - Hardware divide  → plain / operator, no workarounds
+//    - Hardware FPU     → float arithmetic essentially free
+//    - 520 KB SRAM      → no memory pressure
+//
+//  vs Pico 1 version:
+//    - No reciprocal-multiply approximations (just use /)
+//    - Float percussion/click envelopes restored (FPU makes free)
+//    - Spinlock + try-lock pattern retained (still dual-core)
+//    - Polyphony cap from config.h (default 16)
 // ============================================================
 
 #include "tonewheel_voice.h"
@@ -20,8 +20,7 @@
 #include "click.h"
 #include <hardware/sync.h>
 
-#define MAX_TW_VOICES      16   // voice pool size (memory)
-// MAX_ACTIVE_VOICES is defined in config.h
+#define MAX_TW_VOICES  20   // pool size — always >= MAX_ACTIVE_VOICES
 
 class TonewheelManager {
 public:
@@ -46,29 +45,22 @@ public:
 
     void noteOn(uint8_t note, uint8_t velocity) {
         uint32_t irq = spin_lock_blocking(_lock);
-
-        // Ignore duplicate notes
         for (int i = 0; i < MAX_TW_VOICES; i++) {
             if (_voices[i].currentNote == note) {
                 spin_unlock(_lock, irq); return;
             }
         }
-
-        // Enforce polyphony cap: steal oldest if at limit
         if (_countActive() >= MAX_ACTIVE_VOICES) {
             int oldest = _findOldestActive();
             _voices[oldest].noteOff(_voices[oldest].currentNote);
             _age[oldest] = 0;
         }
-
         int slot = _findFreeVoice();
         _voices[slot].noteOn(note, velocity, drawbars);
         _age[slot]   = ++_clock;
         _activeCount = _countActive();
-
         spin_unlock(_lock, irq);
 
-        // Percussion and click outside lock (they're core-1-only state)
         perc.noteOn(note, _activeCount);
         click.trigger();
     }
@@ -90,7 +82,7 @@ public:
     }
 
     void setPitchBend(int16_t bend) {
-        float st = (float)bend / 8192.0f * 2.0f;
+        float st = bend / 8192.0f * 2.0f;
         uint32_t irq = spin_lock_blocking(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++)
             _voices[i].setPitchBend(st, drawbars);
@@ -101,13 +93,13 @@ public:
         if (drawbars.handleCC(cc, value)) {
             uint32_t irq = spin_lock_blocking(_lock);
             _cachedDbSum = drawbars.drawbarSum();
-            propagateDrawbars_locked();
+            _propagate();
             spin_unlock(_lock, irq);
             return true;
         }
         if (perc.handleCC(cc, value)) {
             uint32_t irq = spin_lock_blocking(_lock);
-            propagateDrawbars_locked();
+            _propagate();
             spin_unlock(_lock, irq);
             return true;
         }
@@ -118,38 +110,36 @@ public:
     void propagateDrawbars() {
         uint32_t irq = spin_lock_blocking(_lock);
         _cachedDbSum = drawbars.drawbarSum();
-        propagateDrawbars_locked();
+        _propagate();
         spin_unlock(_lock, irq);
     }
 
-    // ---- Hot path: called once per sample from core 1 -------
+    // ---- Audio hot path — core 1 ----------------------------
     inline int16_t tick() {
         int32_t mix = 0;
 
-        // Non-blocking try-lock: if core 0 is mid-noteOn we skip
-        // the lock and use voice state as-is. At most 1 sample of
-        // stale data — completely inaudible. Never stalls audio.
+        // Non-blocking try-lock: never stalls audio core
         bool locked = spin_try_lock_unsafe(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++)
             mix += _voices[i].tick();
         if (locked) spin_unlock_unsafe(_lock);
 
-        // Scale down: use int64 intermediate to prevent overflow.
-        // 16 voices × max_voice_out(29490) = 471,840
-        // 471,840 × 21845 = 10.3B — overflows int32, fine as int64.
-        // 21845 >> 16 ≈ 1/3
-        mix = (int32_t)((int64_t)mix * 21845 >> 16);
+        // RP2350 has hardware divide — just use /
+        // No reciprocal-multiply approximations needed
+        mix /= 3;
 
         // Percussion scaled by drawbar sum
+        // FPU means float envelope in perc.tick() is free
         if (perc.enabled) {
             int32_t ps = perc.tick();
-            mix += (int32_t)((int64_t)ps * _cachedDbSum / 288);
+            if (_cachedDbSum > 0)
+                mix += (ps * _cachedDbSum) / 288;
         }
 
         // Click
         {
             int32_t cs = click.tick();
-            mix += (int32_t)((int64_t)cs * (_cachedDbSum + 18) / 360);
+            mix += (cs * (_cachedDbSum + 18)) / 360;
         }
 
         if (mix >  32767) mix =  32767;
@@ -174,8 +164,8 @@ public:
         drawbars.debugPrint();
         perc.debugPrint();
         click.debugPrint();
-        Serial.print("  Active voices: "); Serial.println(_activeCount);
-        Serial.print("  Polyphony cap: "); Serial.println(MAX_ACTIVE_VOICES);
+        Serial.print("  Active voices: "); Serial.print(_activeCount);
+        Serial.print(" / "); Serial.println(MAX_ACTIVE_VOICES);
         for (int i = 0; i < MAX_TW_VOICES; i++) {
             if (_voices[i].active) {
                 Serial.print("    note=");
@@ -192,13 +182,12 @@ private:
     int            _cachedDbSum = 72;
     spin_lock_t*   _lock        = nullptr;
 
-    // Call with lock held
-    void propagateDrawbars_locked() {
-        Drawbars effective = drawbars;
-        if (perc.enabled && effective.level[2] > 0)
-            effective.level[2] = (uint8_t)(effective.level[2] * 3 / 4);
+    void _propagate() {
+        Drawbars eff = drawbars;
+        if (perc.enabled && eff.level[2] > 0)
+            eff.level[2] = (uint8_t)(eff.level[2] * 3 / 4);
         for (int i = 0; i < MAX_TW_VOICES; i++)
-            if (_voices[i].active) _voices[i].updateDrawbars(effective);
+            if (_voices[i].active) _voices[i].updateDrawbars(eff);
     }
 
     int _findFreeVoice() {
