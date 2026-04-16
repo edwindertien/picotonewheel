@@ -44,10 +44,10 @@ public:
     }
 
     void noteOn(uint8_t note, uint8_t velocity) {
-        uint32_t irq = spin_lock_blocking(_lock);
+        spin_lock_unsafe_blocking(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++) {
             if (_voices[i].currentNote == note) {
-                spin_unlock(_lock, irq); return;
+                spin_unlock_unsafe(_lock); return;
             }
         }
         if (_countActive() >= MAX_ACTIVE_VOICES) {
@@ -59,48 +59,48 @@ public:
         _voices[slot].noteOn(note, velocity, drawbars);
         _age[slot]   = ++_clock;
         _activeCount = _countActive();
-        spin_unlock(_lock, irq);
+        spin_unlock_unsafe(_lock);
 
         perc.noteOn(note, _activeCount);
         click.trigger();
     }
 
     void noteOff(uint8_t note) {
-        uint32_t irq = spin_lock_blocking(_lock);
+        spin_lock_unsafe_blocking(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++) {
             if (_voices[i].currentNote == note) {
                 _voices[i].noteOff(note);
                 _age[i]      = 0;
                 _activeCount = _countActive();
-                spin_unlock(_lock, irq);
+                spin_unlock_unsafe(_lock);
                 click.trigger();
                 perc.noteOff(_activeCount);
                 return;
             }
         }
-        spin_unlock(_lock, irq);
+        spin_unlock_unsafe(_lock);
     }
 
     void setPitchBend(int16_t bend) {
         float st = bend / 8192.0f * 2.0f;
-        uint32_t irq = spin_lock_blocking(_lock);
+        spin_lock_unsafe_blocking(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++)
             _voices[i].setPitchBend(st, drawbars);
-        spin_unlock(_lock, irq);
+        spin_unlock_unsafe(_lock);
     }
 
     bool handleCC(uint8_t cc, uint8_t value) {
         if (drawbars.handleCC(cc, value)) {
-            uint32_t irq = spin_lock_blocking(_lock);
+            spin_lock_unsafe_blocking(_lock);
             _cachedDbSum = drawbars.drawbarSum();
             _propagate();
-            spin_unlock(_lock, irq);
+            spin_unlock_unsafe(_lock);
             return true;
         }
         if (perc.handleCC(cc, value)) {
-            uint32_t irq = spin_lock_blocking(_lock);
+            spin_lock_unsafe_blocking(_lock);
             _propagate();
-            spin_unlock(_lock, irq);
+            spin_unlock_unsafe(_lock);
             return true;
         }
         if (click.handleCC(cc, value)) return true;
@@ -108,39 +108,39 @@ public:
     }
 
     void propagateDrawbars() {
-        uint32_t irq = spin_lock_blocking(_lock);
+        spin_lock_unsafe_blocking(_lock);
         _cachedDbSum = drawbars.drawbarSum();
         _propagate();
-        spin_unlock(_lock, irq);
+        spin_unlock_unsafe(_lock);
     }
+
+    uint8_t masterVolume = 255;   // 0–255, set via serial 'vol' or CC7
 
     // ---- Audio hot path — core 1 ----------------------------
     inline int16_t tick() {
         int32_t mix = 0;
 
-        // Non-blocking try-lock: never stalls audio core
         bool locked = spin_try_lock_unsafe(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++)
             mix += _voices[i].tick();
         if (locked) spin_unlock_unsafe(_lock);
 
-        // RP2350 has hardware divide — just use /
-        // No reciprocal-multiply approximations needed
         mix /= 3;
 
-        // Percussion scaled by drawbar sum
-        // FPU means float envelope in perc.tick() is free
         if (perc.enabled) {
             int32_t ps = perc.tick();
             if (_cachedDbSum > 0)
                 mix += (ps * _cachedDbSum) / 288;
         }
 
-        // Click
         {
             int32_t cs = click.tick();
             mix += (cs * (_cachedDbSum + 18)) / 360;
         }
+
+        // Master volume: scale by 0–255
+        if (masterVolume < 255)
+            mix = (mix * masterVolume) / 255;
 
         if (mix >  32767) mix =  32767;
         if (mix < -32768) mix = -32768;
@@ -150,14 +150,14 @@ public:
     uint8_t activeCount() const { return _activeCount; }
 
     void allNotesOff() {
-        uint32_t irq = spin_lock_blocking(_lock);
+        spin_lock_unsafe_blocking(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++) {
             if (_voices[i].active)
                 _voices[i].noteOff(_voices[i].currentNote);
             _age[i] = 0;
         }
         _activeCount = 0;
-        spin_unlock(_lock, irq);
+        spin_unlock_unsafe(_lock);
     }
 
     void debugPrint() const {

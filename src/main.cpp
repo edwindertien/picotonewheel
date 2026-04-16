@@ -72,6 +72,16 @@ void midi_pitch_bend(int16_t bend) {
 }
 
 void midi_cc(uint8_t cc, uint8_t value) {
+    if (cc == MIDI_CC_VOLUME) {
+        organ.masterVolume = (uint8_t)((uint16_t)value * 255 / 127);
+#if ENABLE_LCD
+        ui_mark_dirty_bottom();
+#endif
+#if ENABLE_SERIAL
+        Serial.print("Vol: "); Serial.println(organ.masterVolume);
+#endif
+        return;
+    }
     if (organ.handleCC(cc, value)) {
 #if ENABLE_LCD
         ui_mark_dirty_bars();
@@ -154,8 +164,9 @@ void loop() {
 #if ENABLE_SERIAL
     handleSerial();
 #endif
-
-    delay(1);
+    // No delay() here — keep loop() spinning fast so MIDI events
+    // are processed with minimum latency. LCD updates are rate-limited
+    // by the 33ms timer above; serial is non-blocking.
 }
 
 // ============================================================
@@ -190,6 +201,7 @@ static void handleSerial() {
             Serial.println("  pre full|jazz|flute|off");
             Serial.println("  perc on|off|2|3|fast|slow|soft|norm");
             Serial.println("  click <0-127>     — click level");
+            Serial.println("  vol <0-127>       — master volume");
             Serial.println("  pio               — audio PIO state");
         } else if (line == "info") {
             organ.debugPrint();
@@ -222,6 +234,10 @@ static void handleSerial() {
           else if (line.startsWith("click ")) {
             organ.click.level = constrain(line.substring(6).toInt(), 0, 127);
             Serial.print("Click: "); Serial.println(organ.click.level);
+          } else if (line.startsWith("vol ")) {
+            int v = constrain(line.substring(4).toInt(), 0, 127);
+            organ.masterVolume = (uint8_t)((uint16_t)v * 255 / 127);
+            Serial.print("Vol: "); Serial.println(v);
           } else {
             Serial.print("Unknown: "); Serial.println(line);
           }

@@ -290,16 +290,9 @@ static void _draw_status(const TonewheelManager& org) {
     fb_str(84, ty, "C", C_RED, C_STATBG);
     fb_dotbar(94, iy+1, org.click.level*9/127, 9, 4, C_RED, C_DARKBG);
 
-    // Volume bar (placeholder — full vol TBD)
+    // Volume bar — driven by CC7 (masterVolume 0–255)
     fb_str(144, ty, "V", C_BLUE, C_STATBG);
-    fb_hbar(154, iy+2, 44, 6, 8, 8, C_BLUE, C_DARKBG);
-
-    // Voice count (large)
-    char vb[8];
-    uint8_t ac = org.activeCount();
-    snprintf(vb, sizeof(vb), "%d/%d", ac, MAX_ACTIVE_VOICES);
-    uint16_t vc = (ac >= MAX_ACTIVE_VOICES) ? C_RED : C_GREEN;
-    fb_str(204, ty, vb, vc, C_STATBG, 2);
+    fb_hbar(154, iy+2, 90, 6, org.masterVolume, 255, C_BLUE, C_DARKBG);
 }
 
 // ---- Public API --------------------------------------------
@@ -324,11 +317,11 @@ void ui_handle_buttons(TonewheelManager& org) {
 
     if (edge(2)) { if(_sel>0){_sel--; ui_mark_dirty_bars(); ui_mark_dirty_top();} }
     if (edge(3)) { if(_sel<8){_sel++; ui_mark_dirty_bars(); ui_mark_dirty_top();} }
-    if (edge(0)) {
+    if (edge(1)) {  // DOWN → pull bar down → increase level
         uint8_t& lv=org.drawbars.level[_sel];
         if(lv<8){lv++;org.propagateDrawbars();ui_mark_dirty_bars();ui_mark_dirty_top();}
     }
-    if (edge(1)) {
+    if (edge(0)) {  // UP → push bar up → decrease level
         uint8_t& lv=org.drawbars.level[_sel];
         if(lv>0){lv--;org.propagateDrawbars();ui_mark_dirty_bars();ui_mark_dirty_top();}
     }
@@ -339,8 +332,30 @@ void ui_handle_buttons(TonewheelManager& org) {
         else org.drawbars.presetFlute();
         org.propagateDrawbars(); ui_mark_all_dirty();
     }
-    if (edge(5)) { org.perc.enabled=!org.perc.enabled; org.propagateDrawbars(); ui_mark_dirty_bottom(); ui_mark_dirty_top(); }
-    if (edge(6)) { org.perc.thirdHarmonic=!org.perc.thirdHarmonic; ui_mark_dirty_bottom(); }
+    // Button A: cycle through percussion presets
+    // off → 2nd/fast/norm → 2nd/slow/norm → 2nd/fast/soft
+    //      → 3rd/fast/norm → 3rd/slow/norm → 3rd/fast/soft → off
+    if (edge(5)) {
+        static int percState = 0;
+        percState = (percState + 1) % 7;
+        switch (percState) {
+            case 0: org.perc.enabled=false; break;
+            case 1: org.perc.enabled=true; org.perc.thirdHarmonic=false; org.perc.fast=true;  org.perc.soft=false; break;
+            case 2: org.perc.enabled=true; org.perc.thirdHarmonic=false; org.perc.fast=false; org.perc.soft=false; break;
+            case 3: org.perc.enabled=true; org.perc.thirdHarmonic=false; org.perc.fast=true;  org.perc.soft=true;  break;
+            case 4: org.perc.enabled=true; org.perc.thirdHarmonic=true;  org.perc.fast=true;  org.perc.soft=false; break;
+            case 5: org.perc.enabled=true; org.perc.thirdHarmonic=true;  org.perc.fast=false; org.perc.soft=false; break;
+            case 6: org.perc.enabled=true; org.perc.thirdHarmonic=true;  org.perc.fast=true;  org.perc.soft=true;  break;
+        }
+        org.propagateDrawbars();
+        ui_mark_dirty_bottom(); ui_mark_dirty_top();
+    }
+
+    // Button B: toggle click between off and max
+    if (edge(6)) {
+        org.click.level = (org.click.level == 0) ? 127 : 0;
+        ui_mark_dirty_bottom();
+    }
 }
 
 void lcd_begin() {
