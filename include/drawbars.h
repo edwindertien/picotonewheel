@@ -92,6 +92,14 @@ struct Drawbars {
         return level[i] / 8.0f;
     }
 
+    // Sum of all drawbar levels (0..72).
+    // Used to scale percussion proportionally to overall volume.
+    int drawbarSum() const {
+        int s = 0;
+        for (int i = 0; i < NUM_DRAWBARS; i++) s += level[i];
+        return s;
+    }
+
     void debugPrint() const {
         Serial.print("  Drawbars: ");
         for (int i = 0; i < NUM_DRAWBARS; i++) {

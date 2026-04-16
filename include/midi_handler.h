@@ -22,8 +22,9 @@
 // ---- Forward declarations (implemented in main.cpp) --------
 void midi_note_on(uint8_t note, uint8_t velocity);
 void midi_note_off(uint8_t note);
-void midi_pitch_bend(int16_t bend);   // -8192 .. +8191
+void midi_pitch_bend(int16_t bend);
 void midi_cc(uint8_t cc, uint8_t value);
+void midi_program_change(uint8_t program);
 
 // ---- USB-MIDI ----------------------------------------------
 Adafruit_USBD_MIDI usb_midi_iface;
@@ -57,6 +58,8 @@ namespace {
     }
 
     void _dispatchUart(uint8_t status, uint8_t d0, uint8_t d1) {
+        uint8_t ch   = (status & 0x0F) + 1;
+        if (MIDI_CHANNEL != 0 && ch != MIDI_CHANNEL) return;
         uint8_t type = status & 0xF0;
         switch (type) {
             case 0x90:
@@ -66,6 +69,9 @@ namespace {
                 break;
             case 0xB0:
                 midi_cc(d0, d1);
+                break;
+            case 0xC0:
+                midi_program_change(d0);
                 break;
             case 0xE0: {
                 int16_t bend = (int16_t)((d1 << 7) | d0) - 8192;
@@ -99,28 +105,31 @@ namespace {
 // ---- USB-MIDI packet parser --------------------------------
 namespace {
     void _dispatchUsbPacket(uint8_t pkt[4]) {
-        uint8_t cin    = pkt[0] & 0x0F;   // code index number
+        uint8_t cin    = pkt[0] & 0x0F;
         uint8_t status = pkt[1];
         uint8_t d0     = pkt[2];
         uint8_t d1     = pkt[3];
+        uint8_t ch     = (status & 0x0F) + 1;
+        if (MIDI_CHANNEL != 0 && ch != MIDI_CHANNEL) return;
         switch (cin) {
-            case 0x9:   // note on
+            case 0x9:
                 if (d1 > 0) { midi_note_on(d0, d1); break; }
-                // fall through
-            case 0x8:   // note off
+            case 0x8:
                 midi_note_off(d0);
                 break;
-            case 0xB:   // CC
+            case 0xB:
                 midi_cc(d0, d1);
                 break;
-            case 0xE: { // pitch bend
+            case 0xC:
+                midi_program_change(d0);
+                break;
+            case 0xE: {
                 int16_t bend = (int16_t)((d1 << 7) | d0) - 8192;
                 midi_pitch_bend(bend);
                 break;
             }
             default: break;
         }
-        (void)status;
     }
 }
 
