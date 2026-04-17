@@ -1,272 +1,208 @@
-# Project Context — Pico Tonewheel Organ
+# Project Context — Pico Tonewheel Organ (USB Host build)
 
-This file captures the full development context of this project so it can be
-forked and continued in a new conversation, or used as the starting point for
-a different sound module on the same hardware platform.
+This is the handoff document for the `tonewheel_usb` build. Read alongside
+`README.md` before making any changes. Contains architecture decisions,
+hard-won lessons, known pitfalls, and the current state of every component.
 
----
-
-## What this project is
-
-A dual-Pico Hammond tonewheel organ emulator. This repository contains the
-**tone generator** board only. A second Pico (not yet implemented) will scan
-a physical keyboard matrix and send MIDI to this board.
-
-The tone generator runs on a Raspberry Pi Pico 2 (RP2350) stacked with:
-- Waveshare Pico-Audio Rev 2.1 (CS4344 DAC, I2S)
-- Waveshare Pico-LCD-1.14 (ST7789V, 240×135, SPI)
+This build adds a **USB MIDI host port** on GP6/GP7 to the `tonewheel_p2`
+base. Everything in the `tonewheel_p2` CONTEXT.md still applies; this
+document covers what changed and what was learned during the USB host work.
 
 ---
 
-## Hardware platform — reusable for any sound module
+## What changed from tonewheel_p2
 
-The following files are **hardware drivers** with no organ-specific logic.
-They can be reused as-is for any synthesiser project on this stack:
+### 1. Audio moved from PIO0 to PIO2
 
-| File | What it provides |
-|------|-----------------|
-| `audio_driver.h` | PIO I2S driver for CS4344. `audio_driver_init()`, `audio_driver_put(left, right)` |
-| `audio_pio.pio` + `audio_pio.pio.h` | Waveshare PIO I2S program (pre-assembled) |
-| `midi_handler.h` | USB-MIDI + UART MIDI parser. Calls `midi_note_on/off/cc/bend/program_change()` |
-| `lcd.h` / `lcd.cpp` | ST7789V display driver + full 64KB framebuffer + joystick/button handler |
-| `wavetable.h` | Runtime sine LUT generator (`wavetable_init()`, `sineTable[]`) |
-| `oscillator.h` | Phase-accumulator oscillator. `setFrequency()`, `setAmplitude()`, `tick()` → int16 |
+The RP2350 has three PIO blocks. `tonewheel_p2` used PIO0 for I2S audio.
+`Pico-PIO-USB` needs PIO0 (TX) and PIO1 (RX). Moving audio to PIO2 gives
+each subsystem its own block with no conflicts.
 
-The `oscillator.h` is the fundamental building block. Everything else in the
-synth engine is built from it.
+**Change:** `audio_driver.h` line: `_pio = pio2;`
+Also fixed `audio_driver_debug()` which had hardcoded `pio0_hw->` references
+— replaced with `_pio->` throughout.
 
-### Key hardware facts
+**Init order matters:** `audio_driver_init()` must be called before
+`usb_host_init()`. PIO2 must be claimed first so TinyUSB's `hcd_init()`
+takes PIO0 and PIO1 rather than conflicting with audio.
 
-- I2S: GP22=DIN, GP26=BCK, GP27=LRCK — **do not use earlephilhower I2S lib**,
-  pin order is incompatible. Use the PIO driver as-is.
-- LCD: GP8=DC, GP9=CS, GP10=SCK, GP11=MOSI, GP12=RST, GP13=BL
-- LCD buttons: GP2=UP, GP3=PRESS, GP15=A, GP16=LEFT, GP17=B, GP18=DOWN, GP20=RIGHT
-- MIDI UART RX: GP5 (31250 baud, UART1/Serial2)
-- ST7789 RAM offset: col+40, row+53 — must be applied in every window-set call
-- ST7789 requires display inversion ON (0x21) during init
+### 2. Clock: 200 MHz → 240 MHz
 
-### platformio.ini template
+USB host requires exact PIO clock divisors. 240 MHz gives USB TX ÷5 and
+RX ÷2.5 exactly. The audio I2S clkdiv is calculated at runtime via
+`clock_get_hz()` so pitch is unaffected by the clock change.
 
-```ini
-[common]
-platform         = https://github.com/maxgerhardt/platform-raspberrypi.git
-framework        = arduino
-board_build.core = earlephilhower
-lib_deps =
-    https://github.com/adafruit/Adafruit_TinyUSB_Arduino.git
-    https://github.com/FortySevenEffects/arduino_midi_library.git
-build_flags = -O2 -DUSE_TINYUSB -DCFG_TUD_MIDI=1
-monitor_speed = 115200
+### 3. New file: usb_host.h
 
-[env:pico2_tone]
-extends = common
-board   = rpipico2
-board_build.f_cpu = 200000000L   ; 200 MHz — safe on RP2350
+Contains everything USB-host-related in one place:
+- `Adafruit_USBH_Host USBHost` object
+- `usb_host_init()` — configures PIO-USB on GP6/GP7, calls `USBHost.begin(1)`
+- `usb_host_poll()` — calls `USBHost.task()`, called from `loop()`
+- All four TinyUSB MIDI host callbacks with correct signatures for latest TinyUSB
 
-[env:pico_tone]
-extends = common
-board   = rpipico
+### 4. New library: lib/pio_usb/
+
+Vendored `Pico-PIO-USB` v0.5.3. Must be present in the project — TinyUSB's
+`hcd_pio_usb.c` includes our `pio_usb.h` directly.
+
+**Compatibility stub:** `pio_usb_host.c` has a stub appended at the end:
+```cpp
+bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
+                                  uint8_t ep_addr) {
+  (void)root_idx; (void)device_address; (void)ep_addr;
+  return true;
+}
 ```
+The declaration is also in `pio_usb.h`. This satisfies the linker when using
+Adafruit TinyUSB ≥3.5 which calls this function; v0.5.3 doesn't have it.
 
----
+### 5. TinyUSB callback signatures
 
-## Organ-specific architecture
-
-### Synthesis chain
-
-```
-noteOn(note)
-  └─ TonewheelVoice::noteOn()
-       └─ 9× Oscillator::setFrequency(note_freq × drawbar_mult[i])
-            └─ Oscillator::setAmplitude(drawbar_level[i] / 8.0)
-
-loop1() → TonewheelManager::tick() → int16_t sample
-  ├─ 16× TonewheelVoice::tick()
-  │    └─ 9× Oscillator::tick() → sum → /3 headroom
-  ├─ Percussion::tick()    → float envelope × oscillator
-  ├─ Click::tick()         → noise × float envelope
-  └─ masterVolume scale    → soft clip → int16
-```
-
-### Dual-core synchronisation pattern
-
-Critical lesson learned: **`spin_lock_blocking()` disables interrupts and
-breaks USB-MIDI under chord bursts.** Always use:
-
-- `spin_lock_unsafe_blocking()` on core 0 (noteOn/noteOff/CC) — leaves IRQs on
-- `spin_try_lock_unsafe()` on core 1 (tick) — non-blocking, never stalls audio
-- `spin_unlock_unsafe()` for both
-
-The CS4344 has hardware automute triggered by LRCK irregularity. If core 1
-ever stalls (e.g. waiting on a blocking lock), the PIO FIFO drains, LRCK
-stops, and the DAC mutes. Non-blocking try-lock prevents this entirely.
-
-### Performance (Pico 2 @ 200 MHz)
-
-- RP2350 has hardware FPU (float = 1 cycle) and hardware divide (/ = 1 cycle)
-- `loop1()` marked `__not_in_flash_func` — runs from SRAM, no XIP cache misses
-- 16 voices × 9 oscillators = 144 oscillators per sample
-- Each oscillator: phase add + table lookup + integer multiply = ~8 cycles
-- Total per sample: ~1400 cycles / 200M Hz = 7 µs << 22.7 µs budget
-- Comfortable headroom for effects, filters, or more voices
-
-### config.h pattern
-
-All user-facing configuration in one file. Every other file reads from it.
-Pattern: define the value in `config.h`, `#include "config.h"` in every
-header that uses it. No hardcoded magic numbers anywhere else.
-
----
-
-## What was NOT built (next steps)
-
-### Keyboard matrix scanner (second Pico)
-The second Pico will scan a physical organ keyboard matrix and send MIDI
-to the tone generator over UART (GP5) at 31250 baud. The UART parser in
-`midi_handler.h` is already implemented and waiting. The scanner Pico needs:
-- Matrix scan (diode-isolated rows/columns)
-- Debounce
-- Note-on/off with MIDI velocity (from key travel time if dual-contact keys)
-- UART MIDI output
-
-### Effects not yet implemented
-- **Leslie / rotary speaker** — periodic LFO on frequency + amplitude, two
-  rates (chorale slow, tremolo fast), ramp-up/ramp-down between speeds
-- **Vibrato / chorus** — Hammond V/C tabs. Vibrato: pitch LFO only.
-  Chorus: pitch LFO + slightly detuned copy mixed in.
-- **Reverb** — would need a convolution or algorithmic reverb; probably best
-  done externally given CPU budget
-
----
-
-## Forking for a different sound module
-
-To build a different synthesiser on this same hardware, keep:
-- `audio_driver.h`, `audio_pio.pio`, `audio_pio.pio.h`
-- `midi_handler.h`
-- `oscillator.h`, `wavetable.h`
-- `lcd.h`, `lcd.cpp` (adapt `_draw_top`, `_draw_bars`, `_draw_status` for your UI)
-- `platformio.ini`
-
-Replace:
-- `tonewheel_voice.h` → your voice architecture
-- `tonewheel_manager.h` → your polyphonic manager
-- `drawbars.h`, `percussion.h`, `click.h` → your parameters
-- `config.h` → your MIDI mapping and settings
-- `main.cpp` → your MIDI callbacks
-
-The `Oscillator` class is general-purpose and reusable as-is for any
-wavetable synthesis. It can be used for sine, saw, square, or any waveform
-stored in `sineTable[]` — just replace the wavetable content.
-
----
-
-## Analog synth emulator — design sketch
-
-For a follow-up project building a subtractive analog synth emulator on the
-same hardware, here is what the architecture would look like:
-
-### Voice architecture (one polyphonic voice)
-
-```
-Oscillator 1  (VCO1): wavetable — saw / square / tri / sine, detune
-Oscillator 2  (VCO2): wavetable — same waveforms, ±24 semitone offset, detune
-Sub oscillator:        VCO1 one octave down, square wave only
-Noise generator:       LCG white noise (already in click.h as a pattern)
-  │
-  ├─ Mix (VCO1 level, VCO2 level, sub level, noise level)
-  │
-Filter (VCF): 2-pole or 4-pole low-pass, state-variable or ladder model
-  ├─ Cutoff frequency (0–20 kHz)
-  ├─ Resonance (0–1, self-oscillation at 1.0)
-  ├─ Filter envelope amount
-  └─ Keyboard tracking (cutoff tracks note frequency)
-  │
-Amplifier (VCA): envelope-controlled gain
-  │
-Output
-```
-
-### Envelopes
-Each voice needs at minimum two ADSR envelopes: one for the VCA, one for the
-VCF cutoff. With RP2350 FPU, float ADSR is free.
+The latest Adafruit TinyUSB changed all MIDI host callback signatures.
+The correct signatures (as of TinyUSB 3.7.x) are:
 
 ```cpp
-struct ADSR {
-    float attack, decay, sustain, release;  // all in seconds / level
-    float env = 0.0f;
-    enum { IDLE, ATTACK, DECAY, SUSTAIN, RELEASE } state = IDLE;
-    inline float tick();   // called every sample — ~10 cycles with FPU
-};
+void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_cb_data);
+void tuh_midi_umount_cb(uint8_t idx);
+void tuh_midi_rx_cb(uint8_t idx, uint32_t xferred_bytes);
+void tuh_midi_tx_cb(uint8_t idx, uint32_t xferred_bytes);
+bool tuh_midi_packet_read(uint8_t idx, uint8_t packet[4]);  // inline in midi_host.h
 ```
 
-### Filter implementation
-The most important choice. Options in order of CPU cost:
+The parameter is `idx` (interface index), not `dev_addr`. Using the old
+signatures causes a compile error with a clear message showing the expected
+signature.
 
-1. **1-pole RC (6 dB/oct)** — 2 multiplies per sample, sounds thin
-2. **2-pole state variable (SVF, 12 dB/oct)** — ~15 cycles, good for most uses,
-   gives LP/BP/HP simultaneously
-3. **4-pole Moog ladder (24 dB/oct)** — ~40 cycles, the classic analog sound,
-   self-oscillation at high resonance
+---
 
-For a true analog emulator the Moog ladder is the right choice. At 200 MHz
-with 8 voices: 8 × 40 = 320 cycles/sample out of 4500 available. Very
-comfortable.
+## USB host: what works and what doesn't
 
-Moog ladder in fixed-point integer for Pico 1 (no FPU):
-```cpp
-// Simplified Moog ladder — Huovilainen model
-// Input x, cutoff wc (0..1), resonance k (0..4)
-// State: y[4] (4 filter stages)
-float g  = wc * 0.9892f;
-float gg = g * g;
-float feedback = k * (y[3] - x);  // with nonlinearity: tanh(y[3] - x)
-x = x - feedback;
-y[0] = x * g + y[0] * (1.0f - g);
-y[1] = y[0] * g + y[1] * (1.0f - g);
-y[2] = y[1] * g + y[2] * (1.0f - g);
-y[3] = y[2] * g + y[3] * (1.0f - g);
-output = y[3];
+### Works reliably
+- Single USB MIDI device on the host socket (direct or through a hub)
+- Hot-plug/unplug with `allNotesOff()` on disconnect
+- Simultaneous with USB device port (PC/DAW/controller on native USB,
+  keyboard on host socket) — both merge into the engine transparently
+
+### Does not work: two devices through a hub
+
+Both devices enumerate at the USB level (`tuh_mount_cb` fires for both),
+but only the first-connected device gets its MIDI class interface opened
+(`tuh_midi_mount_cb` only fires once).
+
+**Root cause investigated but not resolved.** The TinyUSB hub driver
+processes one port's connection change per interrupt poll cycle and relies
+on the next poll to pick up additional ports. With two devices already
+connected at boot, the second port's change event should appear on the
+subsequent hub status poll. The deferred attach queue (`_usbh_daq`,
+sized to `CFG_TUH_HUB`) should handle this. Despite extensive investigation
+including source-level tracing of the full enumeration state machine in
+`usbh.c`, `hub.c`, and `midi_host.c`, the exact failure point was not
+isolated without TinyUSB debug logging in place.
+
+**To investigate further:** Add `-DCFG_TUSB_DEBUG=2` to build flags and
+`#define SERIAL_TUSB_DEBUG Serial` before the TinyUSB include. The level-2
+log prints every interface open/skip decision with class/subclass values.
+This will show exactly which `TU_VERIFY` in `midih_open` fails for device 2.
+
+**To fix properly:** Replace the vendored `lib/pio_usb/` with the version
+bundled inside Adafruit TinyUSB's own source tree
+(`src/portable/raspberrypi/Pico-PIO-USB/`). The bundled version is kept in
+sync with TinyUSB's hub enumeration expectations; v0.5.3 predates several
+hub-related fixes.
+
+---
+
+## Critical architecture rules (inherited from tonewheel_p2)
+
+All rules from `tonewheel_p2` CONTEXT.md apply. Key ones:
+
+**Spinlock pattern** — never use `spin_lock_blocking()`. Use:
+- Core 0 (MIDI/USB): `spin_lock_unsafe_blocking()`
+- Core 1 (audio tick): `spin_try_lock_unsafe()` — non-blocking
+
+**Core split:**
+- Core 0: MIDI device poll + USB host poll + LCD + serial
+- Core 1: audio hot path (`__not_in_flash_func`) — runs from SRAM
+
+**USB MIDI host callbacks must not make blocking calls.** The `tuh_mount_cb`
+and `tuh_midi_mount_cb` callbacks are called from within `USBHost.task()`.
+Any `_sync` descriptor fetch (e.g. `tuh_descriptor_get_device_sync()`) blocks
+the USB task and can prevent other hub-connected devices from enumerating.
+Keep all callbacks non-blocking.
+
+---
+
+## Hardware: USB-A socket wiring
+
+```
+GP6  ──── D+  (USB-A pin 3, green wire)  ──── 15kΩ pull-down to GND
+GP7  ──── D-  (USB-A pin 2, white wire)
+5V   ──── VBUS (USB-A pin 1, red wire)
+GND  ──── GND  (USB-A pin 4, black wire)
 ```
 
-### LFOs
-One or two LFOs per voice for vibrato, filter wobble, PWM:
-- Same `Oscillator` class, just running at 0.1–20 Hz instead of audio rate
-- Waveforms: sine, triangle, square, sample-and-hold (random)
-- Sync to note-on or free-running
+The 15kΩ pull-down on D+ (GP6) is essential for host mode. Without it the
+Pico appears as a device to anything plugged in and no enumeration occurs.
+This is the same R13 issue documented in the USB2MIDI project context.
 
-### Polyphony
-With 8 voices × (2 VCOs + filter + 2 envelopes + 1 LFO) per voice:
-- ~200 cycles per voice at 200 MHz on RP2350
-- 8 voices = 1600 cycles / 4500 budget = 36% — very comfortable
-- 12 voices = 2400 cycles = 53% — still fine
+---
 
-### MIDI mapping for an analog synth
+## Keyboard scanner — next phase
 
-```cpp
-// config.h for analog synth module
-#define MIDI_CC_VCF_CUTOFF     74   // standard: brightness
-#define MIDI_CC_VCF_RESONANCE  71   // standard: timbre
-#define MIDI_CC_VCF_ENV_AMT    72   // release time (repurposed)
-#define MIDI_CC_VCA_ATTACK     73   // attack time
-#define MIDI_CC_VCA_DECAY      75   // decay time
-#define MIDI_CC_VCA_SUSTAIN    76   // sustain level
-#define MIDI_CC_VCA_RELEASE    72   // release time
-#define MIDI_CC_LFO_RATE       77   // LFO rate
-#define MIDI_CC_LFO_DEPTH      78   // LFO depth
-#define MIDI_CC_OSC_DETUNE     94   // oscillator 2 detune
-#define MIDI_CC_OSC_WAVE       70   // waveform select
-#define MIDI_CC_PORTAMENTO     65   // portamento on/off
-#define MIDI_CC_GLIDE_TIME      5   // portamento time
+The second Pico will scan the physical organ keyboard matrix and send MIDI
+to the tone generator over UART on GP5 at 31250 baud. The UART parser in
+`midi_handler.h` is already wired and waiting.
+
+The scanner Pico architecture:
+- Scan diode-isolated key matrix (rows/columns)
+- Debounce + key travel timing for velocity (dual-contact keys)
+- Send note-on/note-off via UART MIDI at 31250 baud
+- Optionally: also act as a USB MIDI host bridge for additional devices
+
+See `tonewheel_p2/CONTEXT.md` for the full scanner design notes.
+
+---
+
+## File checklist
+
+All files that must be present in the project:
+
 ```
+platformio.ini
+README.md
+CONTEXT.md
 
-### LCD UI for analog synth
-The same `lcd.cpp` framebuffer approach works perfectly. Replace the drawbar
-bars with:
-- Cutoff/resonance display (knob-style arc, or simple bars)
-- ADSR envelope shape visualisation (trapezoid graphic)
-- LFO waveform icon
-- Voice count and patch name in the top bar
+src/
+  config.h
+  main.cpp
+  audio_driver.h          ← uses PIO2 (changed from tonewheel_p2)
+  audio_pio.pio
+  audio_pio.pio.h
+  usb_host.h              ← new in this build
+  midi_handler.h
+  wavetable.h
+  oscillator.h
+  tonewheel_voice.h
+  tonewheel_manager.h
+  drawbars.h
+  percussion.h
+  click.h
+  lcd.h
+  lcd.cpp
+  voice.h                 ← reference only, not used
+  voice_manager.h         ← reference only, not used
 
-The rendering infrastructure (font, `fb_rect`, `fb_hbar`, `fb_str`) is all
-reusable — just write new `_draw_top`, `_draw_main`, `_draw_status` functions.
+lib/
+  pio_usb/
+    library.json
+    pio_usb.h             ← has endpoint_close declaration
+    pio_usb.c
+    pio_usb_host.c        ← has endpoint_close stub at end
+    pio_usb_device.c
+    pio_usb_ll.h
+    pio_usb_configuration.h
+    usb_crc.c / .h
+    usb_definitions.h
+    usb_rx.pio / .pio.h
+    usb_tx.pio / .pio.h
+```

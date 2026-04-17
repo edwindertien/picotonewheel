@@ -21,6 +21,9 @@
 #  include "lcd.h"
 #endif
 #include "midi_handler.h"
+#if ENABLE_USB_HOST
+#  include "usb_host.h"
+#endif
 
 int16_t sineTable[WAVETABLE_SIZE];
 TonewheelManager organ;
@@ -133,7 +136,17 @@ void setup() {
 
     wavetable_init();
     organ.init();
-    audio_driver_init(SAMPLE_RATE);
+    audio_driver_init(SAMPLE_RATE);  // claims PIO2 first
+
+#if ENABLE_USB_HOST
+    // USB host init AFTER audio — PIO2 already claimed,
+    // so TinyUSB will use PIO0 (TX) and PIO1 (RX) as intended
+    usb_host_init();
+#if ENABLE_SERIAL
+    Serial.print("USB host: ON  D+=GP"); Serial.print(MIDI_HOST_DP_PIN);
+    Serial.print(" D-=GP"); Serial.println(MIDI_HOST_DP_PIN + 1);
+#endif
+#endif
 
 #if ENABLE_LCD
     lcd_begin();
@@ -151,6 +164,10 @@ static uint32_t _last_ui_ms = 0;
 
 void loop() {
     midi_handler_poll();
+
+#if ENABLE_USB_HOST
+    usb_host_poll();
+#endif
 
 #if ENABLE_LCD
     ui_handle_buttons(organ);
