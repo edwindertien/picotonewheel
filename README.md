@@ -12,6 +12,10 @@ Post-processing effects chain: overdrive → vibrato → chorus.
 
 ## Hardware
 
+The boards can be stacked, or used (for now) on an expansion board. A board combining MIDI in and USB-HOST in is in the pipeline, so the whole sound module can be a compact stack.
+
+![system overview](images/picotonewheel.jpg)
+
 ### Stacking Order
 
 ```
@@ -164,6 +168,8 @@ Connect at 115200 baud.
 ---
 
 ## Display
+
+![LCD menu](images/menu.jpeg)
 
 ### Top bar (y=0..17)
 
