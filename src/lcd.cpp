@@ -18,6 +18,9 @@
 #include "lcd.h"
 #include "tonewheel_manager.h"
 
+// CPU load measured by core 1, displayed in top bar
+extern volatile uint8_t g_cpu_load_pct;
+
 // ---- Pins --------------------------------------------------
 #define LCD_SCK   10
 #define LCD_MOSI  11
@@ -193,7 +196,22 @@ static void _flush_rows(int y0, int y1) {
 static bool   _d_top  = true;
 static bool   _d_bars = true;
 static bool   _d_stat = true;
-static int    _sel = 2;
+static int    _sel = 2;   // 0..8 = drawbars, 9..16 = effect params
+
+// Name + current value for extended selector positions
+static void _sel_info(const TonewheelManager& org, char* name, char* val) {
+    switch (_sel) {
+        case  9: strcpy(name,"Click");     snprintf(val,8,"%d",org.click.level);          return;
+        case 10: strcpy(name,"Volume");    snprintf(val,8,"%d",org.masterVolume*127/255); return;
+        case 11: strcpy(name,"Drive");     snprintf(val,8,"%d",org.overdrive.drive);      return;
+        case 12: strcpy(name,"Vib Dpt");  snprintf(val,8,"%d",org.vibrato.depth);        return;
+        case 13: strcpy(name,"Vib Rate"); snprintf(val,8,"%d",org.vibrato.rate);         return;
+        case 14: strcpy(name,"Cho Dpt");  snprintf(val,8,"%d",org.chorus.depth);         return;
+        case 15: strcpy(name,"Cho Rate"); snprintf(val,8,"%d",org.chorus.rate);          return;
+        case 16: strcpy(name,"Cho Mix");  snprintf(val,8,"%d",org.chorus.mix);           return;
+        default: name[0]=0; val[0]=0; return;
+    }
+}
 static bool   _bp[7]={}, _bc[7]={};
 static const int BPINS[7]={BTN_UP,BTN_DOWN,BTN_LEFT,BTN_RIGHT,BTN_PRESS,BTN_A,BTN_B};
 static uint32_t _midi_until = 0;
@@ -215,16 +233,30 @@ static void _draw_top(const TonewheelManager& org) {
         name = "Flute";
     fb_str(6, TOP_Y+5, name, C_WHITE, C_TOPBG);
 
-    // Selected drawbar value
+    // Selected parameter info (centre of top bar)
     char buf[14];
-    snprintf(buf, sizeof(buf), "DB%d  %d/8", _sel+1, l[_sel]);
-    fb_str(90, TOP_Y+5, buf, C_AMBER, C_TOPBG);
+    if (_sel <= 8) {
+        // Drawbar mode
+        snprintf(buf, sizeof(buf), "DB%d  %d/8", _sel+1, l[_sel]);
+        fb_str(90, TOP_Y+5, buf, C_AMBER, C_TOPBG);
+    } else {
+        // Effect param mode — show name + value
+        char pname[12], pval[8];
+        _sel_info(org, pname, pval);
+        snprintf(buf, sizeof(buf), "%-8s %s", pname, pval);
+        fb_str(76, TOP_Y+5, buf, C_CYAN, C_TOPBG);
+    }
 
     // Voice count — red when at cap
     uint8_t ac = org.activeCount();
     snprintf(buf, sizeof(buf), "%d/%d", ac, MAX_ACTIVE_VOICES);
     uint16_t vc = (ac >= MAX_ACTIVE_VOICES) ? C_RED : C_GREEN;
     fb_str(185, TOP_Y+5, buf, vc, C_TOPBG);
+
+    // CPU load square: green <50%, yellow <80%, red ≥80%
+    uint8_t cpu = g_cpu_load_pct;
+    uint16_t cc = (cpu >= 80) ? C_RED : (cpu >= 50) ? C_ORANGE : C_GREEN;
+    fb_rect(218, TOP_Y+5, 7, 7, cc);
 
     // MIDI dot
     uint16_t mc = (millis() < _midi_until) ? C_GREEN : C_GREENDIM;
@@ -268,31 +300,87 @@ static void _draw_status(const TonewheelManager& org) {
     fb_rect(0, STAT_Y, LCD_W, STAT_H, C_STATBG);
     fb_rect(0, STAT_Y, LCD_W, 1, C_GRAY);  // top divider line
 
-    int ty = STAT_Y + 5;   // text baseline
-    int iy = STAT_Y + 4;   // icon baseline
+    int ty  = STAT_Y + 5;    // text baseline
+    int iy  = STAT_Y + 4;    // icon baseline
 
-    // MIDI dot
+    // Draw a 2px cyan cursor bar above the selected effect param
+    // Maps _sel 9..16 to x positions of C/V/D/~/W sections
+    static const uint8_t SEL_X[] = {0,0,0,0,0,0,0,0,0,
+        65, 100, 135, 170, 170, 207, 207, 207};
+    static const uint8_t SEL_W[] = {0,0,0,0,0,0,0,0,0,
+        30,  30,  30,  36,  36,  32,  32,  32};
+    if (_sel >= 9 && _sel <= 16) {
+        fb_rect(SEL_X[_sel], STAT_Y+1, SEL_W[_sel], 2, C_CYAN);
+    }
+
+    // ---- MIDI dot (x=0..19) ---------------------------------
     fb_str(4, ty, "M", C_CYAN, C_STATBG);
     uint16_t mc = (millis() < _midi_until) ? C_GREEN : C_GREENDIM;
     fb_rect(14, iy+1, 5, 5, mc);
 
-    // Percussion
+    // ---- Percussion (x=20..75) ------------------------------
     uint16_t pc = org.perc.enabled ? C_ORANGE : C_GRAY;
-    fb_str(24, ty, "P", pc, C_STATBG);
-    fb_rect(33, iy, 10, 10, org.perc.enabled ? C_ORANGE : C_DARKBG);
-    if (!org.perc.enabled) fb_rect(34, iy+1, 8, 8, C_STATBG);
-    char hc[2] = {(char)('0'+(org.perc.thirdHarmonic?3:2)), 0};
-    fb_str(46, ty, hc, pc, C_STATBG);
-    fb_rect(54, iy+2, 6, 6, org.perc.fast ? C_ORANGE : C_GRAY);
-    fb_rect(63, iy+3, 4, 4, org.perc.soft ? C_GRAY : C_ORANGE);
+    fb_str(22, ty, "P", pc, C_STATBG);
+    fb_rect(30, iy, 9, 9, org.perc.enabled ? C_ORANGE : C_DARKBG);
+    if (!org.perc.enabled) fb_rect(31, iy+1, 7, 7, C_STATBG);
+    char hc[2] = {(char)('0' + (org.perc.thirdHarmonic ? 3 : 2)), 0};
+    fb_str(42, ty, hc, pc, C_STATBG);
+    // fast/slow dot + soft/norm dot
+    fb_rect(50, iy+2, 5, 5, org.perc.fast ? C_ORANGE : C_GRAY);
+    fb_rect(57, iy+3, 4, 4, org.perc.soft ? C_GRAY  : C_ORANGE);
 
-    // Click dot bar
-    fb_str(84, ty, "C", C_RED, C_STATBG);
-    fb_dotbar(94, iy+1, org.click.level*9/127, 9, 4, C_RED, C_DARKBG);
+    // ---- Click: C + 4 small squares (x=65..95) --------------
+    // 4 squares represent 4 levels (0-127 → 0-4 filled)
+    fb_str(65, ty, "C", C_RED, C_STATBG);
+    {
+        int v4 = org.click.level * 4 / 127;
+        for (int i = 0; i < 4; i++)
+            fb_rect(75 + i*6, iy+2, 5, 5, i < v4 ? C_RED : C_DARKBG);
+    }
 
-    // Volume bar — driven by CC7 (masterVolume 0–255)
-    fb_str(144, ty, "V", C_BLUE, C_STATBG);
-    fb_hbar(154, iy+2, 90, 6, org.masterVolume, 255, C_BLUE, C_DARKBG);
+    // ---- Volume: V + 4 squares (x=100..130) -----------------
+    fb_str(100, ty, "V", C_BLUE, C_STATBG);
+    {
+        int v4 = org.masterVolume * 4 / 255;
+        for (int i = 0; i < 4; i++)
+            fb_rect(110 + i*6, iy+2, 5, 5, i < v4 ? C_BLUE : C_DARKBG);
+    }
+
+    // ---- Drive: D + 4 squares (x=135..165) ------------------
+    uint16_t dc = org.overdrive.drive > 0 ? C_ORANGE : C_GRAY;
+    fb_str(135, ty, "D", dc, C_STATBG);
+    {
+        int v4 = org.overdrive.drive * 4 / 127;
+        for (int i = 0; i < 4; i++)
+            fb_rect(145 + i*6, iy+2, 5, 5, i < v4 ? C_ORANGE : C_DARKBG);
+    }
+
+    // ---- Vibrato: ~ + 2 rows of 4 squares (x=170..205) -----
+    // top row = depth, bottom row = rate
+    uint16_t vc = org.vibrato.depth > 0 ? C_GREEN : C_GRAY;
+    fb_str(170, ty, "~", vc, C_STATBG);
+    {
+        int d4 = org.vibrato.depth * 4 / 127;
+        int r4 = org.vibrato.rate  * 4 / 127;
+        for (int i = 0; i < 4; i++) {
+            // depth row (top)
+            fb_rect(180 + i*5, iy+1, 4, 3, i < d4 ? C_GREEN : C_DARKBG);
+            // rate row (bottom)
+            fb_rect(180 + i*5, iy+5, 4, 3, i < r4 ? C_GREENDIM : C_DARKBG);
+        }
+    }
+
+    // ---- Chorus: W + depth (top) + mix (bottom) rows (x=207..239) --
+    uint16_t cc2 = org.chorus.depth > 0 ? C_CYAN : C_GRAY;
+    fb_str(207, ty, "W", cc2, C_STATBG);
+    {
+        int d4 = org.chorus.depth * 4 / 127;
+        int m4 = org.chorus.mix   * 4 / 127;
+        for (int i = 0; i < 4; i++) {
+            fb_rect(217 + i*5, iy+1, 4, 3, i < d4 ? C_CYAN : C_DARKBG);  // depth
+            fb_rect(217 + i*5, iy+5, 4, 3, i < m4 ? C_BLUE : C_DARKBG);  // mix
+        }
+    }
 }
 
 // ---- Public API --------------------------------------------
@@ -315,15 +403,45 @@ void ui_handle_buttons(TonewheelManager& org) {
     for (int i=0;i<7;i++) { _bp[i]=_bc[i]; _bc[i]=!digitalRead(BPINS[i]); }
     auto edge=[](int i){ return _bc[i]&&!_bp[i]; };
 
-    if (edge(2)) { if(_sel>0){_sel--; ui_mark_dirty_bars(); ui_mark_dirty_top();} }
-    if (edge(3)) { if(_sel<8){_sel++; ui_mark_dirty_bars(); ui_mark_dirty_top();} }
-    if (edge(1)) {  // DOWN → pull bar down → increase level
-        uint8_t& lv=org.drawbars.level[_sel];
-        if(lv<8){lv++;org.propagateDrawbars();ui_mark_dirty_bars();ui_mark_dirty_top();}
-    }
-    if (edge(0)) {  // UP → push bar up → decrease level
-        uint8_t& lv=org.drawbars.level[_sel];
-        if(lv>0){lv--;org.propagateDrawbars();ui_mark_dirty_bars();ui_mark_dirty_top();}
+    if (edge(2)) { if(_sel>0) {_sel--; ui_mark_dirty_bars(); ui_mark_dirty_top(); ui_mark_dirty_bottom();} }
+    if (edge(3)) { if(_sel<16){_sel++; ui_mark_dirty_bars(); ui_mark_dirty_top(); ui_mark_dirty_bottom();} }
+
+    if (_sel <= 8) {
+        // Drawbar mode: up/down adjusts drawbar level
+        if (edge(1)) {  // DOWN → pull bar down → increase level
+            uint8_t& lv=org.drawbars.level[_sel];
+            if(lv<8){lv++;org.propagateDrawbars();ui_mark_dirty_bars();ui_mark_dirty_top();}
+        }
+        if (edge(0)) {  // UP → push bar up → decrease level
+            uint8_t& lv=org.drawbars.level[_sel];
+            if(lv>0){lv--;org.propagateDrawbars();ui_mark_dirty_bars();ui_mark_dirty_top();}
+        }
+    } else {
+        // Effect param mode: up/down adjusts selected param
+        // Helper: returns pointer to the param and its step/max
+        uint8_t* param = nullptr;
+        uint8_t  step  = 8;
+        uint8_t  mx    = 127;
+        switch (_sel) {
+            case  9: param = &org.click.level;     break;
+            case 10: param = &org.masterVolume; step=16; mx=255; break;
+            case 11: param = &org.overdrive.drive; break;
+            case 12: param = &org.vibrato.depth;   break;
+            case 13: param = &org.vibrato.rate;    break;
+            case 14: param = &org.chorus.depth;    break;
+            case 15: param = &org.chorus.rate;     break;
+            case 16: param = &org.chorus.mix;      break;
+        }
+        if (param) {
+            if (edge(1)) { // DOWN = increase
+                *param = (uint8_t)min((int)*param + step, (int)mx);
+                ui_mark_dirty_bottom(); ui_mark_dirty_top();
+            }
+            if (edge(0)) { // UP = decrease
+                *param = (uint8_t)max((int)*param - step, 0);
+                ui_mark_dirty_bottom(); ui_mark_dirty_top();
+            }
+        }
     }
     if (edge(4)) {
         static int pr=0; pr=(pr+1)%3;

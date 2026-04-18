@@ -62,13 +62,14 @@ public:
     }
 
     // Tick all 9 oscillators and return the mixed sample.
-    // Each partial is weighted by its drawbar amplitude.
+    // pitchMult: vibrato multiplier from Vibrato::pitchMult (1.0 = no shift).
     // Called exactly once per sample.
-    inline int16_t tick()
+    inline int16_t tick(float pitchMult = 1.0f)
     {
         if (!active) return 0;
         int32_t mix = 0;
         for (int i = 0; i < NUM_DRAWBARS; i++) {
+            if (pitchMult != 1.0f) _osc[i].applyPitchMult(pitchMult);
             mix += _osc[i].tick();
         }
         // Divide by 10 for headroom (9 partials at full scale)

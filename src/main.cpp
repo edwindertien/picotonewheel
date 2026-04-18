@@ -81,7 +81,17 @@ void midi_cc(uint8_t cc, uint8_t value) {
         ui_mark_dirty_bottom();
 #endif
 #if ENABLE_SERIAL
-        Serial.print("Vol: "); Serial.println(organ.masterVolume);
+        Serial.print("Vol: "); Serial.println(value);
+#endif
+        return;
+    }
+    if (organ.handleFxCC(cc, value)) {
+#if ENABLE_LCD
+        ui_mark_dirty_bottom();
+#endif
+#if ENABLE_SERIAL
+        Serial.print("FX CC "); Serial.print(cc);
+        Serial.print("="); Serial.println(value);
 #endif
         return;
     }
@@ -189,13 +199,73 @@ void loop() {
 // ============================================================
 //  Core 1  —  audio, runs from SRAM
 // ============================================================
+// CPU load: percentage of audio budget used by tick() computation.
+// Written by core 1, read by core 0 for display. uint8_t write is atomic.
+volatile uint8_t g_cpu_load_pct = 0;
+
 void setup1() { delay(500); }
 
 void __not_in_flash_func(loop1)() {
+    // Single-pass interleaved compute+put — PIO FIFO never starves.
+    // Load measurement: time the entire compute loop using the cycle
+    // counter (DWT CYCCNT, 1-cycle resolution at 240 MHz) then subtract
+    // the known put() blocking time to get compute-only load.
+    //
+    // At 240 MHz, 1 µs = 240 cycles. time_us_32() has only 1µs resolution
+    // which is too coarse for a single tick() call (~12µs).
+    // Instead time the WHOLE 256-sample compute section accurately:
+    // put() is isochronous (always takes BUDGET_US total), so:
+    //   compute_us = elapsed_us - put_blocking_us
+    // But we can't separate them in one pass.
+    //
+    // Simplest accurate approach: time the full loop, which always takes
+    // ≈ BUDGET_US due to blocking puts. Track how often we finish EARLY
+    // (FIFO accepts puts immediately) vs compute being tight.
+    // A better proxy: count non-blocking put() calls. If FIFO has space
+    // when we arrive, compute is ahead of the DAC — we have headroom.
+    // 
+    // Cleanest: use DWT cycle counter around just the tick() calls.
+    // DWT is always available on Cortex-M33 (RP2350).
+
+    static constexpr uint32_t BUDGET_US =
+        (uint32_t)((1000000ULL * BUFFER_FRAMES) / SAMPLE_RATE);
+    static constexpr uint32_t BUDGET_CY =
+        (uint32_t)((uint64_t)240000000 * BUFFER_FRAMES / SAMPLE_RATE);
+
+    // DWT cycle counter — direct register access using RP2350 addresses.
+    // CMSIS CoreDebug/DWT structs are not exposed in the arduino-pico build;
+    // use raw pointers instead (same registers, just no CMSIS wrapper).
+    #define _DCB_DEMCR  (*((volatile uint32_t*)0xE000EDFC))
+    #define _DWT_CYCCNT (*((volatile uint32_t*)0xE0001004))
+    #define _DWT_CTRL   (*((volatile uint32_t*)0xE0001000))
+
+    // Enable DWT cycle counter (idempotent — safe to call every buffer)
+    _DCB_DEMCR |= 0x01000000u;  // TRCENA bit 24
+    _DWT_CYCCNT = 0;
+    _DWT_CTRL  |= 0x00000001u;  // CYCCNTENA bit 0
+
+    // Time only tick() calls by accumulating per-sample cycle counts
+    uint32_t total_cycles = 0;
     for (int i = 0; i < BUFFER_FRAMES; i++) {
+        uint32_t c0 = _DWT_CYCCNT;
         int16_t s = organ.tick();
+        total_cycles += _DWT_CYCCNT - c0;
         audio_driver_put(s, s);
     }
+
+    // load% = compute_cycles / budget_cycles * 100
+    uint32_t load_now = (total_cycles * 100) / BUDGET_CY;
+
+    // Fast-attack, fast-decay IIR — reacts quickly in both directions.
+    // α_attack ≈ 0.5 (rises fast), α_decay ≈ 0.1 (falls in ~10 buffers)
+    static uint32_t load_filt16 = 0;  // ×16 fixed-point
+    uint32_t target = load_now * 16;
+    if (target > load_filt16)
+        load_filt16 = (load_filt16 * 1 + target * 15) / 16; // fast attack
+    else
+        load_filt16 = (load_filt16 * 13 + target * 3)  / 16; // fast decay
+
+    g_cpu_load_pct = (uint8_t)((load_filt16 / 16) > 99 ? 99 : load_filt16 / 16);
 }
 
 // ============================================================
@@ -219,6 +289,12 @@ static void handleSerial() {
             Serial.println("  perc on|off|2|3|fast|slow|soft|norm");
             Serial.println("  click <0-127>     — click level");
             Serial.println("  vol <0-127>       — master volume");
+            Serial.println("  drive <0-127>     — overdrive (0=off)");
+            Serial.println("  vib d <0-127>     — vibrato depth (0=off)");
+            Serial.println("  vib r <0-127>     — vibrato rate");
+            Serial.println("  cho d <0-127>     — chorus depth (0=off)");
+            Serial.println("  cho r <0-127>     — chorus rate");
+            Serial.println("  cho m <0-127>     — chorus wet/dry mix");
             Serial.println("  pio               — audio PIO state");
         } else if (line == "info") {
             organ.debugPrint();
@@ -255,6 +331,24 @@ static void handleSerial() {
             int v = constrain(line.substring(4).toInt(), 0, 127);
             organ.masterVolume = (uint8_t)((uint16_t)v * 255 / 127);
             Serial.print("Vol: "); Serial.println(v);
+          } else if (line.startsWith("drive ")) {
+            organ.overdrive.drive = constrain(line.substring(6).toInt(), 0, 127);
+            Serial.print("Drive: "); Serial.println(organ.overdrive.drive);
+          } else if (line.startsWith("vib d ")) {
+            organ.vibrato.depth = constrain(line.substring(6).toInt(), 0, 127);
+            Serial.print("Vib depth: "); Serial.println(organ.vibrato.depth);
+          } else if (line.startsWith("vib r ")) {
+            organ.vibrato.rate = constrain(line.substring(6).toInt(), 0, 127);
+            Serial.print("Vib rate: "); Serial.println(organ.vibrato.rate);
+          } else if (line.startsWith("cho d ")) {
+            organ.chorus.depth = constrain(line.substring(6).toInt(), 0, 127);
+            Serial.print("Chorus depth: "); Serial.println(organ.chorus.depth);
+          } else if (line.startsWith("cho r ")) {
+            organ.chorus.rate = constrain(line.substring(6).toInt(), 0, 127);
+            Serial.print("Chorus rate: "); Serial.println(organ.chorus.rate);
+          } else if (line.startsWith("cho m ")) {
+            organ.chorus.mix = constrain(line.substring(6).toInt(), 0, 127);
+            Serial.print("Chorus mix: "); Serial.println(organ.chorus.mix);
           } else {
             Serial.print("Unknown: "); Serial.println(line);
           }

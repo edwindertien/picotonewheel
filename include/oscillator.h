@@ -14,15 +14,24 @@
 // ============================================================
 
 struct Oscillator {
-    uint32_t phase;      // current phase  (0 … 2^32-1)
-    uint32_t phaseInc;   // added each sample = freq * 2^32 / Fs
+    uint32_t phase;         // current phase  (0 … 2^32-1)
+    uint32_t phaseInc;      // added each sample = freq * 2^32 / Fs
+    uint32_t _basePhaseInc; // unmodulated phaseInc (for vibrato)
     int16_t  ampI;       // amplitude pre-scaled: 0..256 (256 = full scale)
     bool     active;
 
-    Oscillator() : phase(0), phaseInc(0), ampI(256), active(false) {}
+    Oscillator() : phase(0), phaseInc(0), _basePhaseInc(0), ampI(256), active(false) {}
 
     void setFrequency(float freq_hz) {
         phaseInc = (uint32_t)(freq_hz * (4294967296.0f / SAMPLE_RATE));
+        _basePhaseInc = phaseInc;   // remember for vibrato
+    }
+
+    // Apply a pitch multiplier (vibrato LFO output) directly to phaseInc.
+    // Called once per sample per active oscillator from core 1.
+    // mult = 1.0 → no change. Skipped when mult == 1.0.
+    inline void applyPitchMult(float mult) {
+        phaseInc = (uint32_t)(_basePhaseInc * mult);
     }
 
     // Set amplitude from float 0..1 → pre-scale to integer 0..256

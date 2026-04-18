@@ -1,208 +1,237 @@
-# Project Context — Pico Tonewheel Organ (USB Host build)
+# Project Context — Pico Tonewheel Organ (USB Host + Effects build)
 
 This is the handoff document for the `tonewheel_usb` build. Read alongside
 `README.md` before making any changes. Contains architecture decisions,
-hard-won lessons, known pitfalls, and the current state of every component.
+hard-won lessons, and the current state of every component.
 
-This build adds a **USB MIDI host port** on GP6/GP7 to the `tonewheel_p2`
-base. Everything in the `tonewheel_p2` CONTEXT.md still applies; this
-document covers what changed and what was learned during the USB host work.
+This build extends `tonewheel_p2` with:
+- USB MIDI host port (GP6/GP7)
+- Post-processing effects chain (overdrive, vibrato, chorus)
+- Extended joystick menu (drawbars + effect params)
+- CPU load indicator (DWT cycle counter)
+
+All rules from `tonewheel_p2/CONTEXT.md` still apply. This document covers
+what changed and what was learned.
 
 ---
 
 ## What changed from tonewheel_p2
 
-### 1. Audio moved from PIO0 to PIO2
+### Audio on PIO2
 
-The RP2350 has three PIO blocks. `tonewheel_p2` used PIO0 for I2S audio.
-`Pico-PIO-USB` needs PIO0 (TX) and PIO1 (RX). Moving audio to PIO2 gives
-each subsystem its own block with no conflicts.
+`audio_driver.h` uses `_pio = pio2`. `audio_driver_init()` must be called
+before `usb_host_init()` so PIO2 is claimed first.
 
-**Change:** `audio_driver.h` line: `_pio = pio2;`
-Also fixed `audio_driver_debug()` which had hardcoded `pio0_hw->` references
-— replaced with `_pio->` throughout.
-
-**Init order matters:** `audio_driver_init()` must be called before
-`usb_host_init()`. PIO2 must be claimed first so TinyUSB's `hcd_init()`
-takes PIO0 and PIO1 rather than conflicting with audio.
-
-### 2. Clock: 200 MHz → 240 MHz
-
-USB host requires exact PIO clock divisors. 240 MHz gives USB TX ÷5 and
-RX ÷2.5 exactly. The audio I2S clkdiv is calculated at runtime via
-`clock_get_hz()` so pitch is unaffected by the clock change.
-
-### 3. New file: usb_host.h
-
-Contains everything USB-host-related in one place:
-- `Adafruit_USBH_Host USBHost` object
-- `usb_host_init()` — configures PIO-USB on GP6/GP7, calls `USBHost.begin(1)`
-- `usb_host_poll()` — calls `USBHost.task()`, called from `loop()`
-- All four TinyUSB MIDI host callbacks with correct signatures for latest TinyUSB
-
-### 4. New library: lib/pio_usb/
-
-Vendored `Pico-PIO-USB` v0.5.3. Must be present in the project — TinyUSB's
-`hcd_pio_usb.c` includes our `pio_usb.h` directly.
-
-**Compatibility stub:** `pio_usb_host.c` has a stub appended at the end:
-```cpp
-bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
-                                  uint8_t ep_addr) {
-  (void)root_idx; (void)device_address; (void)ep_addr;
-  return true;
-}
+PIO layout:
 ```
-The declaration is also in `pio_usb.h`. This satisfies the linker when using
-Adafruit TinyUSB ≥3.5 which calls this function; v0.5.3 doesn't have it.
+PIO0: USB TX  (22 instructions)
+PIO1: USB RX  (32 instructions — exactly full)
+PIO2: Audio   (13 instructions)
+```
 
-### 5. TinyUSB callback signatures
+### Clock: 200 → 240 MHz
 
-The latest Adafruit TinyUSB changed all MIDI host callback signatures.
-The correct signatures (as of TinyUSB 3.7.x) are:
+USB host requires clean PIO divisors. 240 MHz gives USB TX ÷5, RX ÷2.5
+exactly. Audio clkdiv recalculates at runtime via `clock_get_hz()`.
 
+### New file: usb_host.h
+
+USB MIDI host. `usb_host_init()` / `usb_host_poll()` + all four TinyUSB
+MIDI host callbacks with correct signatures for latest TinyUSB (3.7.x):
 ```cpp
-void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_cb_data);
+void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *cb_data);
 void tuh_midi_umount_cb(uint8_t idx);
 void tuh_midi_rx_cb(uint8_t idx, uint32_t xferred_bytes);
 void tuh_midi_tx_cb(uint8_t idx, uint32_t xferred_bytes);
-bool tuh_midi_packet_read(uint8_t idx, uint8_t packet[4]);  // inline in midi_host.h
 ```
+Parameter is `idx` (interface index), not `dev_addr`. Wrong signatures give
+a clear compile error showing the expected signature.
 
-The parameter is `idx` (interface index), not `dev_addr`. Using the old
-signatures causes a compile error with a clear message showing the expected
-signature.
+### New file: effects.h
+
+Three post-processing effects, all in one file. Applied in `tick()` after
+voice mixing, before master volume and final clip.
+
+### lib/pio_usb/ compatibility stub
+
+`pio_usb_host.c` has a stub `pio_usb_host_endpoint_close()` appended.
+`pio_usb.h` has its declaration. Required for Adafruit TinyUSB ≥3.5.
 
 ---
 
-## USB host: what works and what doesn't
+## Effects architecture
 
-### Works reliably
-- Single USB MIDI device on the host socket (direct or through a hub)
-- Hot-plug/unplug with `allNotesOff()` on disconnect
-- Simultaneous with USB device port (PC/DAW/controller on native USB,
-  keyboard on host socket) — both merge into the engine transparently
+All effects run on core 1 inside `tick()`. Parameters are `uint8_t` — ARM
+single-byte writes are atomic, no spinlock needed for core 0 updates.
 
-### Does not work: two devices through a hub
+### Chain order in tick()
 
-Both devices enumerate at the USB level (`tuh_mount_cb` fires for both),
-but only the first-connected device gets its MIDI class interface opened
-(`tuh_midi_mount_cb` only fires once).
+```
+voices × 16 → mix/3 → percussion → click
+    → overdrive → chorus → masterVolume → clip → int16
+```
 
-**Root cause investigated but not resolved.** The TinyUSB hub driver
-processes one port's connection change per interrupt poll cycle and relies
-on the next poll to pick up additional ports. With two devices already
-connected at boot, the second port's change event should appear on the
-subsequent hub status poll. The deferred attach queue (`_usbh_daq`,
-sized to `CFG_TUH_HUB`) should handle this. Despite extensive investigation
-including source-level tracing of the full enumeration state machine in
-`usbh.c`, `hub.c`, and `midi_host.c`, the exact failure point was not
-isolated without TinyUSB debug logging in place.
+Vibrato is applied per-voice inside the voice loop (before mixing).
 
-**To investigate further:** Add `-DCFG_TUSB_DEBUG=2` to build flags and
-`#define SERIAL_TUSB_DEBUG Serial` before the TinyUSB include. The level-2
-log prints every interface open/skip decision with class/subclass values.
-This will show exactly which `TU_VERIFY` in `midih_open` fails for device 2.
+### 1. Overdrive (`effects.h` — `Overdrive` struct)
 
-**To fix properly:** Replace the vendored `lib/pio_usb/` with the version
-bundled inside Adafruit TinyUSB's own source tree
-(`src/portable/raspberrypi/Pico-PIO-USB/`). The bundled version is kept in
-sync with TinyUSB's hub enumeration expectations; v0.5.3 predates several
-hub-related fixes.
+**Asymmetric rational waveshaper** — different curves for positive/negative:
+```cpp
+if (x >= 0): y = x / (1 + x)          // smooth rolloff
+if (x <  0): y = x / (1 - 0.5x)       // slightly harder
+```
+Asymmetry generates even harmonics (2nd, 4th) = tube/valve character.
+The old cubic shaper generated only odd harmonics (3rd, 5th) = transistor-harsh.
+Input gain 1.0..5.0 (drive 1..127), output compensated by 1/g.
+CC 85, serial `drive <0-127>`.
+
+### 2. Vibrato (`effects.h` — `Vibrato` struct)
+
+Sine LFO, `pitchMult` output read by `TonewheelManager::tick()` and passed
+to `TonewheelVoice::tick(pitchMult)`, which calls `Oscillator::applyPitchMult()`
+directly on `phaseInc`. This avoids `powf()` in the hot path.
+
+`applyPitchMult()` multiplies from `_basePhaseInc` (stored at `setFrequency()`
+time) not from the current `phaseInc` — so modulation never accumulates/drifts.
+
+Max depth controlled by `VIBRATO_MAX_SEMITONES` in `config.h` (default 0.25).
+0.75 was the original value — far too heavy. 0.25 = authentic Hammond scanner.
+CC 86 (depth) + 87 (rate), serial `vib d/r <0-127>`.
+
+### 3. Chorus (`effects.h` — `Chorus` struct)
+
+**Dual quadrature BBD chorus** (Boss CE-2 architecture). Two delay lines,
+LFOs 90° apart:
+```
+lfo0 = sin(phase)         delay line A
+lfo1 = sin(phase + 0.25)  delay line B (cos)
+wet  = (wetA + wetB) / 2
+```
+When one LFO is at turnaround (fastest pointer movement, most artifact-prone),
+the other is at its flattest — artifacts cancel. This eliminates the periodic
+"loopround click" that a single delay line produces.
+
+**Modulation range**: ±2ms max (depth=127 → ±1ms swing). The original 5ms
+range gave ±44 cents pitch deviation at mid-depth — far too extreme, sounded
+like a pitch loop. 2ms gives ±~20 cents max = subtle and musical.
+
+**Wet mix**: 0..50% controlled by separate `mix` parameter (CC 90, default 64).
+Depth and mix are independent — depth controls pitch wobble character,
+mix controls how present the effect is.
+
+Two delay buffers: 2 × 2048 × 2 bytes = 8 KB SRAM.
+CC 88 (depth) + 89 (rate) + 90 (mix), serial `cho d/r/m <0-127>`.
 
 ---
 
-## Critical architecture rules (inherited from tonewheel_p2)
+## CPU load measurement
 
-All rules from `tonewheel_p2` CONTEXT.md apply. Key ones:
+`loop1()` measures tick() compute time using the DWT cycle counter.
+Standard CMSIS `CoreDebug`/`DWT` structs are not exposed in arduino-pico —
+use raw register pointers instead:
 
-**Spinlock pattern** — never use `spin_lock_blocking()`. Use:
-- Core 0 (MIDI/USB): `spin_lock_unsafe_blocking()`
-- Core 1 (audio tick): `spin_try_lock_unsafe()` — non-blocking
+```cpp
+#define _DCB_DEMCR  (*((volatile uint32_t*)0xE000EDFC))  // bit 24 = TRCENA
+#define _DWT_CYCCNT (*((volatile uint32_t*)0xE0001004))  // cycle counter
+#define _DWT_CTRL   (*((volatile uint32_t*)0xE0001000))  // bit 0 = CYCCNTENA
+```
 
-**Core split:**
-- Core 0: MIDI device poll + USB host poll + LCD + serial
-- Core 1: audio hot path (`__not_in_flash_func`) — runs from SRAM
+These are architectural constants on all Cortex-M33 cores.
+Accumulated per-sample cycle counts / budget cycles = load%.
 
-**USB MIDI host callbacks must not make blocking calls.** The `tuh_mount_cb`
-and `tuh_midi_mount_cb` callbacks are called from within `USBHost.task()`.
-Any `_sync` descriptor fetch (e.g. `tuh_descriptor_get_device_sync()`) blocks
-the USB task and can prevent other hub-connected devices from enumerating.
-Keep all callbacks non-blocking.
+**Critical**: do NOT use double-pass (compute all → push all). The PIO FIFO
+holds only 8 samples (181µs). During a 3ms compute-only pass the FIFO drains,
+LRCK stops, and the CS4344 hardware automute triggers — exactly the same
+failure mode as the wrong spinlock. Always interleave compute and put.
+
+IIR filter: fast attack (α≈0.94), fast decay (α≈0.19) so indicator responds
+quickly in both directions. Displayed as 7×7 square in top bar.
 
 ---
 
-## Hardware: USB-A socket wiring
+## Extended joystick menu
 
-```
-GP6  ──── D+  (USB-A pin 3, green wire)  ──── 15kΩ pull-down to GND
-GP7  ──── D-  (USB-A pin 2, white wire)
-5V   ──── VBUS (USB-A pin 1, red wire)
-GND  ──── GND  (USB-A pin 4, black wire)
-```
+`_sel` ranges 0..16:
+- 0..8 = drawbars 1–9 (UP/DOWN adjusts level 0–8, step 1)
+- 9 = click (step 8, range 0–127)
+- 10 = master volume (step 16, range 0–255)
+- 11 = overdrive drive (step 8)
+- 12 = vibrato depth (step 8)
+- 13 = vibrato rate (step 8)
+- 14 = chorus depth (step 8)
+- 15 = chorus rate (step 8)
+- 16 = chorus mix (step 8)
 
-The 15kΩ pull-down on D+ (GP6) is essential for host mode. Without it the
-Pico appears as a device to anything plugged in and no enumeration occurs.
-This is the same R13 issue documented in the USB2MIDI project context.
+Top bar shows `DB3  5/8` for drawbars, `Vib Dpt  42` for effect params.
+A 2px cyan bar appears above the relevant status section when _sel > 8.
+`ui_mark_dirty_bottom()` must be called on LEFT/RIGHT navigation so the
+cursor bar redraws (and disappears when returning to drawbar mode).
+
+---
+
+## Critical rules inherited from tonewheel_p2
+
+**Spinlock**: use `spin_lock_unsafe_blocking()` on core 0, `spin_try_lock_unsafe()`
+on core 1. Never `spin_lock_blocking()` — disables IRQs, breaks USB-MIDI.
+
+**CS4344 automute**: if LRCK stops for ~200ms the DAC automutes silently.
+Core 1 must never stall. The non-blocking try-lock and interleaved compute+put
+both serve this requirement.
+
+**Callbacks**: `tuh_mount_cb` and `tuh_midi_mount_cb` must not call any `_sync`
+TinyUSB functions — doing so blocks `USBHost.task()` and can prevent hub-connected
+devices from enumerating.
 
 ---
 
 ## Keyboard scanner — next phase
 
-The second Pico will scan the physical organ keyboard matrix and send MIDI
-to the tone generator over UART on GP5 at 31250 baud. The UART parser in
-`midi_handler.h` is already wired and waiting.
-
-The scanner Pico architecture:
-- Scan diode-isolated key matrix (rows/columns)
-- Debounce + key travel timing for velocity (dual-contact keys)
-- Send note-on/note-off via UART MIDI at 31250 baud
-- Optionally: also act as a USB MIDI host bridge for additional devices
-
-See `tonewheel_p2/CONTEXT.md` for the full scanner design notes.
+Scanner Pico sends UART MIDI at 31250 baud to GP5. `midi_handler.h` already
+listens on `Serial2` (UART1). Wire GP0 (scanner TX) → GP5 (tone gen RX) + GND.
+No optocoupler needed between two Picos on the same ground.
 
 ---
 
 ## File checklist
 
-All files that must be present in the project:
-
 ```
 platformio.ini
-README.md
-CONTEXT.md
+README.md / CONTEXT.md
 
 src/
-  config.h
-  main.cpp
-  audio_driver.h          ← uses PIO2 (changed from tonewheel_p2)
-  audio_pio.pio
-  audio_pio.pio.h
-  usb_host.h              ← new in this build
-  midi_handler.h
+  config.h              — ALL config including effects CC map and scaling
+  main.cpp              — Core 0/1, MIDI callbacks, serial, CPU load
+  audio_driver.h        — PIO2 I2S
+  audio_pio.pio/.pio.h
+  usb_host.h            — USB MIDI host, TinyUSB callbacks
+  midi_handler.h        — USB device + UART MIDI
+  effects.h             — Overdrive, Vibrato, Chorus
   wavetable.h
-  oscillator.h
-  tonewheel_voice.h
-  tonewheel_manager.h
+  oscillator.h          — has applyPitchMult() + _basePhaseInc for vibrato
+  tonewheel_voice.h     — tick(pitchMult) passes vibrato to oscillators
+  tonewheel_manager.h   — effect objects, handleFxCC(), effects in tick()
   drawbars.h
   percussion.h
   click.h
-  lcd.h
-  lcd.cpp
-  voice.h                 ← reference only, not used
-  voice_manager.h         ← reference only, not used
+  lcd.h / lcd.cpp       — extended selector, CPU square, cursor bar
 
 lib/
   pio_usb/
-    library.json
-    pio_usb.h             ← has endpoint_close declaration
-    pio_usb.c
-    pio_usb_host.c        ← has endpoint_close stub at end
-    pio_usb_device.c
-    pio_usb_ll.h
-    pio_usb_configuration.h
-    usb_crc.c / .h
-    usb_definitions.h
-    usb_rx.pio / .pio.h
-    usb_tx.pio / .pio.h
+    pio_usb.h           — has endpoint_close declaration
+    pio_usb_host.c      — has endpoint_close stub at end
+    (+ other files)
 ```
+
+---
+
+## Planned next modules (separate projects, shared platform)
+
+- **Analog synth** — VCO/VCF/ADSR, Moog ladder filter. Design sketch in
+  `tonewheel_p2/CONTEXT.md`. Start from `tonewheel_usb` as platform base.
+- **FM synth** — operator-based, algorithm display on LCD
+- **E-piano** — wavetable/sample playback
+- **TR-808 clone** — step sequencer, different main loop architecture
+
+All share: `audio_driver.h`, `midi_handler.h`, `usb_host.h`, `lcd.h/cpp`
+(drawing primitives), `oscillator.h`, `wavetable.h`. Only voice engine,
+voice manager, and LCD UI differ per module.

@@ -1,12 +1,12 @@
-# Pico Tonewheel Organ — Tone Generator (USB Host build)
+# Pico Tonewheel Organ — Tone Generator (USB Host + Effects build)
 
-A Hammond-style tonewheel organ tone generator built on the Raspberry Pi Pico 2 (RP2350), using a Waveshare Pico-Audio Rev 2.1 DAC and Waveshare Pico-LCD-1.14 display. Receives MIDI from three simultaneous sources and merges them into the synthesis engine:
+A Hammond-style tonewheel organ tone generator built on the Raspberry Pi Pico 2 (RP2350), using a Waveshare Pico-Audio Rev 2.1 DAC and Waveshare Pico-LCD-1.14 display. Receives MIDI from three simultaneous sources merged into the synthesis engine:
 
 - **USB device** (Pico's native USB port) — PC, DAW, or USB MIDI controller
 - **USB host** (GP6/GP7 socket) — one USB MIDI keyboard or controller
 - **UART** (GP5) — keyboard matrix scanner Pico (next build phase)
 
-This is the **tone generator board** in a two-Pico system. The companion keyboard matrix scanner sends MIDI to this board over UART. The tone generator can also be driven by any external MIDI source via USB or UART.
+Post-processing effects chain: overdrive → vibrato → chorus.
 
 ---
 
@@ -16,8 +16,8 @@ This is the **tone generator board** in a two-Pico system. The companion keyboar
 
 ```
 [Pico-LCD-1.14]   ← top
-[Pico-Audio]      ← middle  (pass-through header exposes all Pico GPIO)
-[Pico / Pico 2]   ← bottom
+[Pico-Audio]      ← middle
+[Pico 2]          ← bottom
 ```
 
 ### Pin Assignments
@@ -30,7 +30,7 @@ This is the **tone generator board** in a two-Pico system. The companion keyboar
 | I2S BCK | GP26 | Bit clock |
 | I2S LRCK | GP27 | Word select |
 
-Audio uses **PIO2** (not PIO0) to leave PIO0 and PIO1 free for USB host.
+Audio uses **PIO2** (not PIO0) to leave PIO0/PIO1 free for USB host.
 
 **Pico-LCD-1.14 (SPI1 — hard-wired on PCB):**
 
@@ -64,9 +64,9 @@ Audio uses **PIO2** (not PIO0) to leave PIO0 and PIO1 free for USB host.
 | VBUS | 5V / VSYS | Powers connected device |
 | GND | GND | |
 
-USB-A connector pinout (looking into socket, left to right): VBUS(red) · D−(white) · D+(green) · GND(black).
+USB-A pinout (looking into socket, left to right): VBUS(red) · D−(white) · D+(green) · GND(black).
 
-**MIDI UART (hardware MIDI-in via optocoupler):**
+**MIDI UART (hardware MIDI-in or scanner Pico):**
 
 | Signal | GPIO |
 |--------|------|
@@ -76,32 +76,23 @@ USB-A connector pinout (looking into socket, left to right): VBUS(red) · D−(w
 
 ## Building
 
-### Requirements
-
-- VSCode + PlatformIO extension
-- earlephilhower Arduino-Pico core (installed automatically)
-
 ### Environments
 
 ```
-pico2_tone    — Pico 2 (RP2350, 240 MHz) — full build with USB host
+pico2_tone    — Pico 2 (RP2350, 240 MHz) — full build with USB host + effects
 pico2_nohost  — Pico 2 (RP2350, 200 MHz) — no USB host (audio/MIDI test)
-pico_tone     — Pico 1 (RP2040, 133 MHz) — no USB host
+pico_tone     — Pico 1 (RP2040, 133 MHz) — no USB host, no DWT cycle counter
 ```
-
-240 MHz is used for the USB host build because it gives exact PIO clock divisors for USB full-speed timing (USB TX ÷5, RX ÷2.5). Audio pitch is unaffected — the I2S clkdiv is calculated at runtime from the actual clock.
 
 ```bash
 pio run -e pico2_tone --target upload
 ```
 
-The vendored `lib/pio_usb/` library must be present. It provides the PIO-based USB host hardware layer used by TinyUSB.
-
 ---
 
-## Configuration
+## Configuration (config.h)
 
-All configurable values are in `src/config.h`.
+All user-facing values are in `src/config.h`.
 
 ### Feature flags
 
@@ -111,108 +102,148 @@ All configurable values are in `src/config.h`.
 #define ENABLE_USB_HOST   1   // 0 = disable USB host socket
 ```
 
-### USB host pin
+### Polyphony and audio
 
 ```cpp
-#define MIDI_HOST_DP_PIN  6   // D+ on GP6, D- automatically on GP7
+#define MAX_ACTIVE_VOICES  16   // reduce if CPU load indicator goes red
+#define SAMPLE_RATE        44100
+#define BUFFER_FRAMES      256
 ```
 
-### Polyphony, MIDI channel, MIDI CC mapping
+### Effects scaling
 
-Same as the `tonewheel_p2` build — see that README for the full table.
+```cpp
+#define VIBRATO_MAX_SEMITONES  0.25f  // max pitch deviation at depth=127
+                                       // 0.25 = authentic Hammond
+                                       // 0.5  = noticeable, 1.0 = strong
+#define CHORUS_MIX_DEFAULT     64     // default wet mix (0..127 → 0..50%)
+```
 
----
+### MIDI CC map
 
-## PIO Resource Layout
-
-The RP2350 has three PIO blocks. This project uses all three:
-
-| PIO | Used for | Programs | Instructions |
-|-----|----------|----------|-------------|
-| PIO0 | USB host TX | `usb_tx_dpdm` | 22 / 32 |
-| PIO1 | USB host RX | `usb_edge_detector` + `usb_nrzi_decoder` | 32 / 32 |
-| PIO2 | Audio I2S | `audio_pio` | 13 / 32 |
-
-`audio_driver_init()` must be called before `usb_host_init()` so PIO2 is claimed first, leaving PIO0 and PIO1 for TinyUSB to use in the correct order.
-
----
-
-## USB Host Notes
-
-### What works
-- One USB MIDI device plugged directly into the host socket
-- One USB MIDI device plugged through a hub (the device connected first enumerates and works)
-- Hot-plug and unplug — `allNotesOff()` is called on disconnect
-
-### What doesn't work
-- Two USB MIDI devices simultaneously through a hub — the second device enumerates at the USB level but TinyUSB's MIDI class driver only opens the first. This is a known limitation of the vendored `pio_usb` v0.5.3 library combined with the current TinyUSB hub driver's enumeration sequencing. It can be resolved in a future build by vendoring a newer version of `Pico-PIO-USB`.
-
-### Practical workflow
-- One device on the USB host socket (keyboard)
-- One device on the USB device port / PC connection (drawbar controller or DAW)
-- UART on GP5 for the keyboard matrix scanner Pico
-
-### Compatibility stub
-The vendored `lib/pio_usb/pio_usb_host.c` contains a stub for `pio_usb_host_endpoint_close()` which was added in a later version of Pico-PIO-USB. The Adafruit TinyUSB library's `hcd_pio_usb.c` calls it; the stub satisfies the linker without breaking functionality.
+| CC | Parameter | Range |
+|----|-----------|-------|
+| 7 | Master volume | 0–127 |
+| 12–20 | Drawbars 1–9 | 0–127 |
+| 80 | Percussion on/off | ≥64 = on |
+| 81 | Percussion harmonic | ≥64 = 3rd |
+| 82 | Percussion decay | ≥64 = fast |
+| 83 | Percussion level | ≥64 = soft |
+| 84 | Key click level | 0–127 |
+| 85 | Overdrive | 0=off, 1–127 |
+| 86 | Vibrato depth | 0=off, 1–127 |
+| 87 | Vibrato rate | 0–127 (0.5–9 Hz) |
+| 88 | Chorus depth | 0=off, 1–127 |
+| 89 | Chorus rate | 0–127 (0.2–3 Hz) |
+| 90 | Chorus mix | 0–127 (0–50% wet) |
 
 ---
 
 ## Serial Commands
 
-Connect at 115200 baud. Same command set as `tonewheel_p2`:
+Connect at 115200 baud.
 
 | Command | Effect |
 |---------|--------|
 | `help` | List all commands |
-| `info` | Print organ state |
+| `info` | Organ state |
 | `all` | All notes off |
-| `db 888000000` | Set all 9 drawbars |
+| `db 888000000` | Set drawbars (9 digits 0–8) |
 | `pre full\|jazz\|flute\|off` | Load preset |
-| `perc on\|off\|2\|3\|fast\|slow\|soft\|norm` | Percussion controls |
+| `perc on\|off\|2\|3\|fast\|slow\|soft\|norm` | Percussion |
 | `click <0-127>` | Key click level |
 | `vol <0-127>` | Master volume |
-| `pio` | Audio PIO debug state |
+| `drive <0-127>` | Overdrive (0=off) |
+| `vib d <0-127>` | Vibrato depth |
+| `vib r <0-127>` | Vibrato rate |
+| `cho d <0-127>` | Chorus depth |
+| `cho r <0-127>` | Chorus rate |
+| `cho m <0-127>` | Chorus wet mix |
+| `pio` | Audio PIO debug |
 
 ---
 
 ## Display
 
-Identical to `tonewheel_p2`. See that README for the full UI description.
+### Top bar (y=0..17)
 
-**Joystick direction:** stick DOWN pulls the drawbar down (increases level, more amber). Stick UP pushes the bar up (decreases level).
+```
+[Preset name]  [Param name + value]  [voices]  [CPU]  [MIDI]
+```
+
+- **Preset name** — Custom / Full organ / Jazz / Flute
+- **Centre** — selected drawbar `DB3  5/8` or effect param `Vib Dpt  42`
+- **Voice count** — `n/16`, turns red at polyphony cap
+- **CPU square** — green <50%, orange 50–79%, red ≥80%
+- **MIDI dot** — flashes green on any MIDI event
+
+### Drawbar area (y=19..108)
+
+9 amber bars, amber at top = pulled out. The selected bar/parameter is highlighted.
+
+### Status bar (y=110..134)
+
+```
+M●  P■ 3 ·  C ■■□□  V ■■■□  D ■□□□  ~ ::::  W ::::
+                                             ^ depth  ^ depth
+                                               rate     mix
+```
+
+| Symbol | Meaning |
+|--------|---------|
+| `M` + dot | MIDI activity |
+| `P` + square | Percussion on/off, harmonic, fast/slow, soft/norm |
+| `C` + 4 squares | Click level (0–4 filled) |
+| `V` + 4 squares | Master volume (0–4 filled) |
+| `D` + 4 squares | Overdrive (0–4 filled) |
+| `~` + 2×4 squares | Vibrato: top row = depth, bottom row = rate |
+| `W` + 2×4 squares | Chorus: top row = depth, bottom row = mix |
+
+A **cyan underline** appears above the status section currently selected by the joystick.
+
+### Joystick navigation
+
+| Direction | Action |
+|-----------|--------|
+| LEFT / RIGHT | Navigate: drawbars 1–9, then click, volume, drive, vib-depth, vib-rate, cho-depth, cho-rate, cho-mix |
+| UP / DOWN | Adjust selected parameter (drawbars: ±1 level; effects: ±8 steps) |
+| PRESS | Cycle preset: Full → Jazz → Flute → Full… |
+| Button A | Cycle percussion presets |
+| Button B | Toggle click on/off |
 
 ---
 
-## File Structure
+## Effects
 
-```
-platformio.ini          Build config (pico2_tone, pico2_nohost, pico_tone)
+### Overdrive
 
-src/
-  config.h              ALL configuration
-  main.cpp              Core 0 + Core 1 entry points, MIDI callbacks, serial
-  audio_driver.h        PIO I2S on PIO2
-  audio_pio.pio/.pio.h  Waveshare I2S PIO program
-  usb_host.h            USB MIDI host — init, poll, TinyUSB callbacks
-  midi_handler.h        USB device MIDI + UART MIDI
-  wavetable.h           Sine LUT
-  oscillator.h          Phase-accumulator oscillator
-  tonewheel_voice.h     9-oscillator voice (one per drawbar)
-  tonewheel_manager.h   Polyphonic manager, spinlock, masterVolume
-  drawbars.h            9-drawbar state and CC handling
-  percussion.h          Hammond percussion
-  click.h               Key click
-  lcd.h / lcd.cpp       ST7789V display driver
+Asymmetric tube-style waveshaper. Positive and negative halves clip at different rates, generating even harmonics (2nd, 4th) characteristic of valve amplifiers. Sounds warm rather than harsh. Unity-gain compensated — output level stays close to bypass regardless of drive amount. CC 85, serial `drive <0-127>`.
 
-lib/
-  pio_usb/              Vendored Pico-PIO-USB v0.5.3 + compatibility stub
-```
+### Vibrato
+
+Sine LFO modulates oscillator frequency via direct `phaseInc` manipulation — no `powf()` in the audio path. Max depth set by `VIBRATO_MAX_SEMITONES` in `config.h` (default 0.25 semitones = authentic Hammond scanner vibrato). CC 86 (depth) + 87 (rate), serial `vib d/r <0-127>`.
+
+### Chorus
+
+Dual quadrature BBD-style chorus (Boss CE-2 architecture). Two delay lines driven by sine LFOs 90° apart. When one LFO is at its turnaround (fastest modulation, most artifact-prone), the other is at its flattest — the two lines mask each other's reversal artifacts. Produces smooth, continuous chorus with no periodic click. CC 88 (depth) + 89 (rate) + 90 (mix), serial `cho d/r/m <0-127>`.
+
+### CPU load indicator
+
+Core 1 times each `tick()` call using the DWT cycle counter (240 MHz resolution, raw register access at `0xE0001004`). The accumulated compute time per buffer vs the 5.8ms budget gives true audio CPU load. Displayed as a coloured square in the top bar — green <50%, orange 50–79%, red ≥80%. If it stays orange/red, reduce `MAX_ACTIVE_VOICES` in `config.h`.
+
+---
+
+## USB Host
+
+One USB MIDI device on the host socket (direct or through a hub). Two devices simultaneously through a hub are not reliably supported with the vendored `pio_usb` v0.5.3.
+
+Practical workflow: keyboard on USB host, drawbar controller on USB device port (PC connection), scanner Pico on UART GP5.
 
 ---
 
 ## Known Limitations and Next Steps
 
-- **Keyboard matrix scanner** — the second Pico that scans the physical keyboard and sends MIDI over UART to GP5. Next build phase.
-- **USB hub multi-device** — single device only on the host socket. See USB Host Notes above.
-- **Leslie / rotary speaker** — not implemented.
-- **Vibrato / chorus** — not implemented.
+- **Keyboard matrix scanner** — second Pico, UART MIDI to GP5. Next build phase.
+- **USB hub multi-device** — see USB Host section above.
+- **Leslie / rotary speaker** — not implemented. Suggested: use hardware Leslie unit.
+- **Vibrato / chorus** — implemented. Leslie would add rotating speaker simulation on top.

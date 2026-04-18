@@ -18,6 +18,7 @@
 #include "drawbars.h"
 #include "percussion.h"
 #include "click.h"
+#include "effects.h"
 #include <hardware/sync.h>
 
 #define MAX_TW_VOICES  20   // pool size — always >= MAX_ACTIVE_VOICES
@@ -116,13 +117,35 @@ public:
 
     uint8_t masterVolume = 255;   // 0–255, set via serial 'vol' or CC7
 
+    // ---- Effects -------------------------------------------
+    Overdrive overdrive;
+    Vibrato   vibrato;
+    Chorus    chorus;
+
+    // Handle effects CCs — returns true if consumed
+    bool handleFxCC(uint8_t cc, uint8_t value) {
+        switch (cc) {
+            case MIDI_CC_DRIVE:          overdrive.drive   = value; return true;
+            case MIDI_CC_VIBRATO_DEPTH:  vibrato.depth     = value; return true;
+            case MIDI_CC_VIBRATO_RATE:   vibrato.rate      = value; return true;
+            case MIDI_CC_CHORUS_DEPTH:   chorus.depth      = value; return true;
+            case MIDI_CC_CHORUS_RATE:    chorus.rate       = value; return true;
+            case MIDI_CC_CHORUS_MIX:     chorus.mix        = value; return true;
+            default: return false;
+        }
+    }
+
     // ---- Audio hot path — core 1 ----------------------------
     inline int16_t tick() {
         int32_t mix = 0;
 
+        // 1. Vibrato LFO tick (updates pitchMult before voices read it)
+        vibrato.tick();
+        float pm = vibrato.pitchMult;
+
         bool locked = spin_try_lock_unsafe(_lock);
         for (int i = 0; i < MAX_TW_VOICES; i++)
-            mix += _voices[i].tick();
+            mix += _voices[i].tick(pm);
         if (locked) spin_unlock_unsafe(_lock);
 
         mix /= 3;
@@ -137,6 +160,12 @@ public:
             int32_t cs = click.tick();
             mix += (cs * (_cachedDbSum + 18)) / 360;
         }
+
+        // 2. Overdrive
+        mix = overdrive.process(mix);
+
+        // 3. Chorus
+        mix = chorus.process(mix);
 
         // Master volume: scale by 0–255
         if (masterVolume < 255)
