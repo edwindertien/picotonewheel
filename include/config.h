@@ -25,22 +25,22 @@
 // ---- MIDI --------------------------------------------------
 #define MIDI_CHANNEL    0   // 0=OMNI
 
-#define MIDI_CC_DRAWBAR_1   12
-#define MIDI_CC_DRAWBAR_2   13
-#define MIDI_CC_DRAWBAR_3   14
-#define MIDI_CC_DRAWBAR_4   15
-#define MIDI_CC_DRAWBAR_5   16
-#define MIDI_CC_DRAWBAR_6   17
-#define MIDI_CC_DRAWBAR_7   18
-#define MIDI_CC_DRAWBAR_8   19
-#define MIDI_CC_DRAWBAR_9   20
+#define MIDI_CC_DRAWBAR_1   1
+#define MIDI_CC_DRAWBAR_2   2
+#define MIDI_CC_DRAWBAR_3   3
+#define MIDI_CC_DRAWBAR_4   4
+#define MIDI_CC_DRAWBAR_5   5
+#define MIDI_CC_DRAWBAR_6   6
+#define MIDI_CC_DRAWBAR_7   7
+#define MIDI_CC_DRAWBAR_8   8
+#define MIDI_CC_DRAWBAR_9   9
 
 #define MIDI_CC_PERC_ONOFF      80
 #define MIDI_CC_PERC_HARMONIC   81
 #define MIDI_CC_PERC_DECAY      82
 #define MIDI_CC_PERC_LEVEL      83
 #define MIDI_CC_CLICK           84
-#define MIDI_CC_VOLUME           7
+#define MIDI_CC_VOLUME           10
 
 #define MIDI_NOTE_PERC_TOGGLE   -1
 #define MIDI_PROGCHANGE_PRESETS  1
