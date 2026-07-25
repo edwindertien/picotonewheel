@@ -143,6 +143,7 @@ inline void midi_handler_init()
     TinyUSBDevice.setProductDescriptor("Tonewheel Organ");
 
     // UART MIDI on Serial2 (UART1, GP4/GP5)
+    pinMode(MIDI_UART_RX, INPUT_PULLUP);
     Serial2.setRX(MIDI_UART_RX);
     Serial2.begin(MIDI_UART_BAUD);
 }
