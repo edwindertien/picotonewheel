@@ -288,7 +288,7 @@ Order: voices → percussion + click → **overdrive → chorus → Leslie** →
 
 #### Overdrive
 
-![overdrive](docs/08_overdrive.svg)
+![overdrive](docs/08_overdrive.png)
 
 An asymmetric soft clipper (even + odd harmonics, valve-like) with gain from 0 to +36 dB. It had to be built carefully, because **a plain waveshaper at this drive aliases badly**: harmonics above 22 kHz fold back as inharmonic hash that sounds like noise. The shipped design uses 2× oversampling and antiderivative anti-aliasing, a gentle roll-off (16 kHz at low drive → 5 kHz at max) and a DC blocker, and keeps the **bass out of the clipper** so low notes stay clean. A loudness-following makeup keeps the level about **+2.5 dB over the clean signal at maximum drive** (set by `OD_LEVEL_DB`) for one note or a six-note chord alike.
 
@@ -308,7 +308,7 @@ Two delay lines (20 ms centre, up to ±2 ms swing, 0.2–3 Hz) driven by LFOs a 
 
 #### Leslie
 
-![leslie](docs/09_leslie.svg)
+![leslie](docs/09_leslie.png)
 
 A crossover at 800 Hz splits the signal: the **horn** (highs) gets a modulated delay — the Doppler pitch shift, ±0.5 ms, about ±2 % pitch at full speed — plus 60 % amplitude modulation; the **drum** (lows) gets 40 % amplitude modulation. Two virtual microphones a quarter turn apart give a **stereo** output. Switching speeds does not jump: the rotors accelerate and decelerate exponentially with different inertia for horn and drum, exactly the "wind-up" you hear on a real cabinet. On "stop" the rotors wind down and the effect then fades to the dry signal and switches itself off completely.
 
