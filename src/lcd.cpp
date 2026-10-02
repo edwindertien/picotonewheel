@@ -249,8 +249,9 @@ static void _draw_top(const TonewheelManager& org) {
 
     // Voice count — red when at cap
     uint8_t ac = org.activeCount();
-    snprintf(buf, sizeof(buf), "%d/%d", ac, MAX_ACTIVE_VOICES);
-    uint16_t vc = (ac >= MAX_ACTIVE_VOICES) ? C_RED : C_GREEN;
+    const uint8_t vlim = org.voiceLimit;   // effective limit (the load governor may lower it)
+    snprintf(buf, sizeof(buf), "%d/%d", ac, vlim);
+    uint16_t vc = (ac >= vlim) ? C_RED : C_GREEN;
     fb_str(185, TOP_Y+5, buf, vc, C_TOPBG);
 
     // CPU load square: green <50%, yellow <80%, red ≥80%

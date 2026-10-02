@@ -139,3 +139,32 @@ static inline uint8_t midi_switch3(uint8_t v) { return v < 32 ? 0 : (v < 94 ? 1 
 #define LESLIE_MIC_OFFSET       0.25f   // right "microphone" phase offset (rotor cycles)
 #define LESLIE_MAKEUP           1.25f   // output makeup gain (AM lowers the average level)
 #define LESLIE_STOP_HZ          0.15f   // below this (and switch on stop) the effect fades to dry
+
+// ============================================================
+//  Load governor — keeps the audio CPU load below a safe level
+// ============================================================
+// Core 1 measures what each oscillator really costs and limits polyphony so
+// the DAC never starves (starvation shows up as pitch drop, then silence).
+// Voices over the limit fade out (VOICE_FADE_SAMPLES) instead of being cut.
+#define GOV_TARGET_LOAD_PCT   80    // polyphony is capped so predicted load stays below this
+#define GOV_EMERGENCY_PCT     92    // measured load above this sheds a voice at once
+#define GOV_MIN_VOICES        3     // never limit below this
+#define GOV_UP_BUFFERS        170   // spare capacity needed for ~1 s before allowing 1 more voice
+#define VOICE_FADE_SAMPLES    220   // ~5 ms fade-out for stolen voices
+#define VIBRATO_BLOCK         16    // vibrato phase increments are updated every N samples
+#define ENABLE_PERF           1     // per-stage cycle counters for the `perf` serial command
+
+// ============================================================
+//  Overdrive (effects.h)
+// ============================================================
+#ifndef OD_MAX_GAIN_DB
+#define OD_MAX_GAIN_DB    36.0f     // drive gain at CC value 127 (0 dB at CC value 1)
+#endif
+#ifndef OD_GAIN_CURVE
+#define OD_GAIN_CURVE     1.0f      // 1.0 = gain in dB rises linearly with the drive value; >1 = back-loaded
+#endif
+#ifndef OD_LEVEL_DB
+#define OD_LEVEL_DB       2.5f      // loudness at max drive relative to the clean signal (dB)
+#endif
+#define OD_LPF_HIGH_HZ    16000.0f  // post-clipper rolloff at lowest drive
+#define OD_LPF_LOW_HZ     5000.0f   // ... and at max drive

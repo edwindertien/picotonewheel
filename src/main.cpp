@@ -16,6 +16,7 @@
 #include "wavetable.h"
 #include "oscillator.h"
 #include "tonewheel_manager.h"
+#include "perf.h"
 #include "audio_driver.h"
 #if ENABLE_LCD
 #  include "lcd.h"
@@ -168,6 +169,7 @@ static uint32_t _last_ui_ms = 0;
 
 void loop() {
     midi_handler_poll();
+    organ.serviceGovernor();     // fade out held notes beyond the load-based voice limit
 
 #if ENABLE_USB_HOST
     usb_host_poll();
@@ -199,67 +201,37 @@ volatile uint8_t g_cpu_load_pct = 0;
 
 void setup1() { delay(500); }
 
+// Everything below is force-inlined into loop1() (see tick() / effects.h), and
+// loop1() lives in SRAM, so the audio path never executes from flash.
 void __not_in_flash_func(loop1)() {
-    // Single-pass interleaved compute+put — PIO FIFO never starves.
-    // Load measurement: time the entire compute loop using the cycle
-    // counter (DWT CYCCNT, 1-cycle resolution at 240 MHz) then subtract
-    // the known put() blocking time to get compute-only load.
-    //
-    // At 240 MHz, 1 µs = 240 cycles. time_us_32() has only 1µs resolution
-    // which is too coarse for a single tick() call (~12µs).
-    // Instead time the WHOLE 256-sample compute section accurately:
-    // put() is isochronous (always takes BUDGET_US total), so:
-    //   compute_us = elapsed_us - put_blocking_us
-    // But we can't separate them in one pass.
-    //
-    // Simplest accurate approach: time the full loop, which always takes
-    // ≈ BUDGET_US due to blocking puts. Track how often we finish EARLY
-    // (FIFO accepts puts immediately) vs compute being tight.
-    // A better proxy: count non-blocking put() calls. If FIFO has space
-    // when we arrive, compute is ahead of the DAC — we have headroom.
-    // 
-    // Cleanest: use DWT cycle counter around just the tick() calls.
-    // DWT is always available on Cortex-M33 (RP2350).
-
-    static constexpr uint32_t BUDGET_US =
-        (uint32_t)((1000000ULL * BUFFER_FRAMES) / SAMPLE_RATE);
+    // Cycle budget for one buffer
     static constexpr uint32_t BUDGET_CY =
-        (uint32_t)((uint64_t)240000000 * BUFFER_FRAMES / SAMPLE_RATE);
+        (uint32_t)((uint64_t)F_CPU * BUFFER_FRAMES / SAMPLE_RATE);
 
-    // DWT cycle counter — direct register access using RP2350 addresses.
-    // CMSIS CoreDebug/DWT structs are not exposed in the arduino-pico build;
-    // use raw pointers instead (same registers, just no CMSIS wrapper).
-    #define _DCB_DEMCR  (*((volatile uint32_t*)0xE000EDFC))
-    #define _DWT_CYCCNT (*((volatile uint32_t*)0xE0001004))
-    #define _DWT_CTRL   (*((volatile uint32_t*)0xE0001000))
+    perf_enable();   // DWT is per core: enable on core 1 (idempotent)
 
-    // Enable DWT cycle counter (idempotent — safe to call every buffer)
-    _DCB_DEMCR |= 0x01000000u;  // TRCENA bit 24
-    _DWT_CYCCNT = 0;
-    _DWT_CTRL  |= 0x00000001u;  // CYCCNTENA bit 0
-
-    // Time only tick() calls by accumulating per-sample cycle counts
+    // Interleaved compute + put — the PIO FIFO must never starve (CS4344 automute).
+    // Time only the tick() calls, not the blocking put().
     uint32_t total_cycles = 0;
     for (int i = 0; i < BUFFER_FRAMES; i++) {
-        uint32_t c0 = _DWT_CYCCNT;
+        const uint32_t c0 = perf_now();
         int16_t sl, sr;
         organ.tick(sl, sr);
-        total_cycles += _DWT_CYCCNT - c0;
+        total_cycles += perf_now() - c0;
         audio_driver_put(sl, sr);
     }
 
-    // load% = compute_cycles / budget_cycles * 100
-    uint32_t load_now = (total_cycles * 100) / BUDGET_CY;
+    // Load governor: caps polyphony so the load stays below GOV_TARGET_LOAD_PCT
+    organ.governor(total_cycles, BUDGET_CY);
 
-    // Fast-attack, fast-decay IIR — reacts quickly in both directions.
-    // α_attack ≈ 0.5 (rises fast), α_decay ≈ 0.1 (falls in ~10 buffers)
-    static uint32_t load_filt16 = 0;  // ×16 fixed-point
-    uint32_t target = load_now * 16;
+    // Display value: fast-attack, fast-decay IIR (x16 fixed point)
+    const uint32_t load_now = (uint32_t)(((uint64_t)total_cycles * 100) / BUDGET_CY);
+    static uint32_t load_filt16 = 0;
+    const uint32_t target = load_now * 16;
     if (target > load_filt16)
-        load_filt16 = (load_filt16 * 1 + target * 15) / 16; // fast attack
+        load_filt16 = (load_filt16 * 1 + target * 15) / 16;   // fast attack
     else
-        load_filt16 = (load_filt16 * 13 + target * 3)  / 16; // fast decay
-
+        load_filt16 = (load_filt16 * 13 + target * 3) / 16;   // fast decay
     g_cpu_load_pct = (uint8_t)((load_filt16 / 16) > 99 ? 99 : load_filt16 / 16);
 }
 
@@ -292,6 +264,7 @@ static void handleSerial() {
             Serial.println("  cho m <0-127>     — chorus wet/dry mix");
             Serial.println("  cho a <0-127>     — chorus amount (depth+mix together, like the pot)");
             Serial.println("  les stop|slow|fast — Leslie speed (run-up/down applies)");
+            Serial.println("  perf              — audio load breakdown + polyphony limit");
             Serial.println("  pio               — audio PIO state");
         } else if (line == "info") {
             organ.debugPrint();
@@ -350,6 +323,21 @@ static void handleSerial() {
             int v = constrain(line.substring(6).toInt(), 0, 127);
             organ.chorus.depth = v; organ.chorus.mix = v;
             Serial.print("Chorus amount: "); Serial.println(v);
+          } else if (line == "perf") {
+            const TonewheelManager::Stats& st = organ.stats;
+            Serial.print("load "); Serial.print(st.loadPct); Serial.print("%  =  voices ");
+            Serial.print(st.voicesPct); Serial.print("%  overdrive ");
+            Serial.print(st.odPct); Serial.print("%  chorus ");
+            Serial.print(st.chorusPct); Serial.print("%  leslie ");
+            Serial.print(st.leslieP); Serial.println("%  (rest = perc/click/vol/clip)");
+            Serial.print("voice limit "); Serial.print(organ.voiceLimit);
+            Serial.print("/"); Serial.print(MAX_ACTIVE_VOICES);
+            Serial.print("   held notes "); Serial.print(organ.activeCount());
+            Serial.print("   oscillators "); Serial.print(st.oscillators);
+            Serial.print("   partials/note "); Serial.println(st.partialsPerNote);
+            Serial.print("measured: "); Serial.print(st.perOscCycles / 10.0f, 1);
+            Serial.print(" cycles/oscillator/sample, "); Serial.print(st.restCycles);
+            Serial.println(" cycles/sample for everything else");
           } else if (line == "les stop") { organ.leslie.mode = 0; Serial.println("Leslie: stop");
           } else if (line == "les slow") { organ.leslie.mode = 1; Serial.println("Leslie: slow");
           } else if (line == "les fast") { organ.leslie.mode = 2; Serial.println("Leslie: fast");
