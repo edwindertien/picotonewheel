@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 // ============================================================
 //  config.h  —  Pico 2 (RP2350) optimised build
 //  Overclock: 200 MHz  |  Voices: 16  |  Wavetable: 4096 pts
@@ -25,22 +26,22 @@
 // ---- MIDI --------------------------------------------------
 #define MIDI_CHANNEL    0   // 0=OMNI
 
-#define MIDI_CC_DRAWBAR_1   1
-#define MIDI_CC_DRAWBAR_2   2
-#define MIDI_CC_DRAWBAR_3   3
-#define MIDI_CC_DRAWBAR_4   4
-#define MIDI_CC_DRAWBAR_5   5
-#define MIDI_CC_DRAWBAR_6   6
-#define MIDI_CC_DRAWBAR_7   7
-#define MIDI_CC_DRAWBAR_8   8
-#define MIDI_CC_DRAWBAR_9   9
+#define MIDI_CC_DRAWBAR_1   12
+#define MIDI_CC_DRAWBAR_2   13
+#define MIDI_CC_DRAWBAR_3   14
+#define MIDI_CC_DRAWBAR_4   15
+#define MIDI_CC_DRAWBAR_5   16
+#define MIDI_CC_DRAWBAR_6   17
+#define MIDI_CC_DRAWBAR_7   18
+#define MIDI_CC_DRAWBAR_8   19
+#define MIDI_CC_DRAWBAR_9   20
 
 #define MIDI_CC_PERC_ONOFF      80
 #define MIDI_CC_PERC_HARMONIC   81
 #define MIDI_CC_PERC_DECAY      82
 #define MIDI_CC_PERC_LEVEL      83
 #define MIDI_CC_CLICK           84
-#define MIDI_CC_VOLUME           10
+#define MIDI_CC_VOLUME           21   // keyboard pot 1
 
 #define MIDI_NOTE_PERC_TOGGLE   -1
 #define MIDI_PROGCHANGE_PRESETS  1
@@ -65,7 +66,7 @@
 
 // ---- Effects CC mapping ------------------------------------
 // Overdrive
-#define MIDI_CC_DRIVE           85   // 0=off, 1–127=drive amount
+#define MIDI_CC_DRIVE           22   // keyboard pot 2: 0=off, 1–127=drive amount
 
 // Vibrato
 #define MIDI_CC_VIBRATO_DEPTH   86   // 0=off, 1–127=depth
@@ -80,3 +81,61 @@
 #define MIDI_CC_CHORUS_RATE     89   // 0..127=rate (0.2–3 Hz)
 #define MIDI_CC_CHORUS_MIX      90   // 0..127=wet mix (0..50%)
 #define CHORUS_MIX_DEFAULT      64   // default mix (~25% wet)
+
+// ============================================================
+//  Keyboard controls: 3 pots, 3 three-state switches, Leslie switch
+// ============================================================
+// Pots (continuous 0..127):
+//   CC21 = master volume  (MIDI_CC_VOLUME above)
+//   CC22 = overdrive      (MIDI_CC_DRIVE above)
+#define MIDI_CC_CHORUS_AMOUNT   23   // keyboard pot 3: sets chorus depth AND mix together
+                                     // (rate stays as set by CC89 / serial)
+
+// Three-state switches send 2 / 62 / 126. Thresholds sit halfway between
+// those values: <32 = position 0, <94 = position 1, otherwise position 2.
+static inline uint8_t midi_switch3(uint8_t v) { return v < 32 ? 0 : (v < 94 ? 1 : 2); }
+
+#define MIDI_CC_PERC_SWITCH     24   // 0 = off, 1 = on (2nd harmonic), 2 = on (3rd harmonic)
+#define MIDI_CC_VIBRATO_SWITCH  25   // 0 = off, 1 = medium, 2 = high
+#define MIDI_CC_CLICK_SWITCH    26   // 0 = off, 1 = medium, 2 = high
+
+// Switch positions 1 and 2 → parameter values
+#define VIBRATO_SWITCH_MEDIUM   64   // vibrato depth (0..127), see VIBRATO_MAX_SEMITONES
+#define VIBRATO_SWITCH_HIGH     127
+#define CLICK_LEVEL_MEDIUM      40   // click level (0..255 scale, same as CC84)
+#define CLICK_LEVEL_HIGH        110
+
+// ============================================================
+//  Leslie (rotary speaker simulation, effects.h)
+// ============================================================
+#define MIDI_CC_LESLIE          27   // half-moon switch: slow / stop / fast
+
+// What each switch position selects: 0 = stop, 1 = slow (chorale), 2 = fast (tremolo).
+// Default: LOW value = slow, MIDDLE = stop, HIGH = fast.
+// If the switch turns out to be wired the other way round, just swap LOW and HIGH.
+#define LESLIE_POS_LOW          1
+#define LESLIE_POS_MID          0
+#define LESLIE_POS_HIGH         2
+
+#define LESLIE_STEREO           1       // 0 = both outputs carry the same mono mix
+#define LESLIE_CROSSOVER_HZ     800.0f  // horn (highs) / drum (lows) split
+
+// Rotor speeds (real Leslie 122: horn 48/400 rpm, drum 40/342 rpm)
+#define LESLIE_HORN_SLOW_HZ     0.8f
+#define LESLIE_HORN_FAST_HZ     6.7f
+#define LESLIE_DRUM_SLOW_HZ     0.67f
+#define LESLIE_DRUM_FAST_HZ     5.7f
+
+// Run-up / run-down: time constants in seconds (exponential approach to the
+// new speed, ~3 time constants to get there). The drum is much heavier.
+#define LESLIE_HORN_ACCEL_S     0.8f
+#define LESLIE_HORN_DECEL_S     1.5f
+#define LESLIE_DRUM_ACCEL_S     2.0f
+#define LESLIE_DRUM_DECEL_S     3.5f
+
+#define LESLIE_HORN_DEPTH       0.6f    // amplitude modulation depth, 0..1
+#define LESLIE_DRUM_DEPTH       0.4f
+#define LESLIE_HORN_DOPPLER_MS  0.5f    // horn radius as delay swing (0.5 ms ≈ ±2% pitch at fast)
+#define LESLIE_MIC_OFFSET       0.25f   // right "microphone" phase offset (rotor cycles)
+#define LESLIE_MAKEUP           1.25f   // output makeup gain (AM lowers the average level)
+#define LESLIE_STOP_HZ          0.15f   // below this (and switch on stop) the effect fades to dry

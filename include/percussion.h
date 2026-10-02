@@ -13,6 +13,7 @@
 #define PERC_CC_HARMONIC MIDI_CC_PERC_HARMONIC
 #define PERC_CC_DECAY    MIDI_CC_PERC_DECAY
 #define PERC_CC_LEVEL    MIDI_CC_PERC_LEVEL
+#define PERC_CC_SWITCH   MIDI_CC_PERC_SWITCH
 
 // Decay time constants: envelope multiplied each sample
 // fast ~0.3 s: exp(-1/(0.3*44100))
@@ -68,8 +69,16 @@ public:
         return _osc.tick();
     }
 
+    // Three-position switch: 0 = off, 1 = on (2nd harmonic), 2 = on (3rd harmonic)
+    void setMode(uint8_t mode) {
+        enabled       = (mode != 0);
+        thirdHarmonic = (mode == 2);
+        if (!enabled) { _osc.active = false; _env = 0.0f; }
+    }
+
     bool handleCC(uint8_t cc, uint8_t value) {
         switch (cc) {
+            case PERC_CC_SWITCH:   setMode(midi_switch3(value)); return true;
             case PERC_CC_ONOFF:
                 enabled = (value >= 64);
                 if (!enabled) { _osc.active = false; _env = 0.0f; }

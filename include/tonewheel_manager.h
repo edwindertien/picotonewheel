@@ -115,17 +115,27 @@ public:
         spin_unlock_unsafe(_lock);
     }
 
-    uint8_t masterVolume = 255;   // 0–255, set via serial 'vol' or CC7
+    uint8_t masterVolume = 255;   // 0–255, set via serial 'vol' or MIDI_CC_VOLUME
 
     // ---- Effects -------------------------------------------
     Overdrive overdrive;
     Vibrato   vibrato;
     Chorus    chorus;
+    Leslie    leslie;
 
     // Handle effects CCs — returns true if consumed
     bool handleFxCC(uint8_t cc, uint8_t value) {
         switch (cc) {
             case MIDI_CC_DRIVE:          overdrive.drive   = value; return true;
+            case MIDI_CC_CHORUS_AMOUNT:  chorus.depth = value; chorus.mix = value; return true;
+            case MIDI_CC_LESLIE:         leslie.setSwitch(value);   return true;
+            case MIDI_CC_VIBRATO_SWITCH:
+                switch (midi_switch3(value)) {
+                    case 0:  vibrato.depth = 0;                       break;
+                    case 1:  vibrato.depth = VIBRATO_SWITCH_MEDIUM;   break;
+                    default: vibrato.depth = VIBRATO_SWITCH_HIGH;     break;
+                }
+                return true;
             case MIDI_CC_VIBRATO_DEPTH:  vibrato.depth     = value; return true;
             case MIDI_CC_VIBRATO_RATE:   vibrato.rate      = value; return true;
             case MIDI_CC_CHORUS_DEPTH:   chorus.depth      = value; return true;
@@ -136,7 +146,9 @@ public:
     }
 
     // ---- Audio hot path — core 1 ----------------------------
-    inline int16_t tick() {
+    // Stereo: the Leslie produces two "microphone" signals.
+    // With the Leslie stopped both channels carry the same mono signal.
+    inline void tick(int16_t& left, int16_t& right) {
         int32_t mix = 0;
 
         // 1. Vibrato LFO tick (updates pitchMult before voices read it)
@@ -167,13 +179,29 @@ public:
         // 3. Chorus
         mix = chorus.process(mix);
 
-        // Master volume: scale by 0–255
-        if (masterVolume < 255)
-            mix = (mix * masterVolume) / 255;
+        // 4. Leslie (mono in, stereo out)
+        int32_t l, r;
+        leslie.process(mix, l, r);
 
-        if (mix >  32767) mix =  32767;
-        if (mix < -32768) mix = -32768;
-        return (int16_t)mix;
+        // Master volume: scale by 0–255
+        if (masterVolume < 255) {
+            l = (l * masterVolume) / 255;
+            r = (r * masterVolume) / 255;
+        }
+
+        if (l >  32767) l =  32767;
+        if (l < -32768) l = -32768;
+        if (r >  32767) r =  32767;
+        if (r < -32768) r = -32768;
+        left  = (int16_t)l;
+        right = (int16_t)r;
+    }
+
+    // Mono convenience wrapper (average of both channels)
+    inline int16_t tick() {
+        int16_t l, r;
+        tick(l, r);
+        return (int16_t)(((int32_t)l + (int32_t)r) / 2);
     }
 
     uint8_t activeCount() const { return _activeCount; }
@@ -193,6 +221,10 @@ public:
         drawbars.debugPrint();
         perc.debugPrint();
         click.debugPrint();
+        Serial.print("  Leslie: ");
+        Serial.print(leslie.mode == 0 ? "stop" : leslie.mode == 1 ? "slow" : "fast");
+        Serial.print("  horn "); Serial.print(leslie.hornHz, 2);
+        Serial.print(" Hz  drum "); Serial.print(leslie.drumHz, 2); Serial.println(" Hz");
         Serial.print("  Active voices: "); Serial.print(_activeCount);
         Serial.print(" / "); Serial.println(MAX_ACTIVE_VOICES);
         for (int i = 0; i < MAX_TW_VOICES; i++) {

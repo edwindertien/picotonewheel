@@ -6,9 +6,10 @@
 //  percussion and click, before master volume and final clip.
 //
 //  Chain order:
-//    1. Overdrive  — cubic soft clip waveshaper
+//    1. Overdrive  — asymmetric tube-style waveshaper
 //    2. Vibrato    — sine LFO pitch modulation (all voices)
-//    3. Chorus     — BBD-style delay line + LFO
+//    3. Chorus     — dual quadrature BBD-style delay line
+//    4. Leslie     — rotary speaker (horn + drum), stereo output
 //
 //  All methods called from core 1 only. No Serial, no malloc.
 //  Parameters are public — set from core 0 via CC or serial.
@@ -20,12 +21,15 @@
 #include "config.h"
 
 // ---- Fast sine approximation (no table, ~10 FPU cycles) ----
-// phase: 0.0 .. 1.0 (full cycle, wraps automatically)
+// phase: 0.0 .. 1.0 (one full cycle, any value is wrapped). Returns sin(2*pi*phase).
+// Parabola + one refinement step: max error ~0.001, continuous at the wrap point.
+// (The previous polynomial was off by 0.54 at the ends of its range, giving a
+//  step of ~1.08 in the LFO once per cycle -> audible click in chorus/vibrato.)
 static inline float _fx_sin(float phase) {
-    phase -= floorf(phase);
-    float p = phase * 2.0f - 1.0f;
-    float p2 = p * p;
-    return p * (3.138982f - p2 * (5.133625f - p2 * 2.532422f));
+    float x = phase - floorf(phase + 0.5f);   // -0.5 .. +0.5
+    float t = 2.0f * x;                       // -1 .. +1
+    float y = 4.0f * t * (1.0f - fabsf(t));   // parabola through sin(pi*t)
+    return 0.225f * (y * fabsf(y) - y) + y;   // refinement
 }
 
 // ============================================================
@@ -191,5 +195,164 @@ struct Chorus {
         // Mix: 0..50% wet (mix=127 → 50%)
         float wetMix = (float)mix * (0.5f / 127.0f);
         return (int32_t)((float)x * (1.0f - wetMix) + wet * wetMix);
+    }
+};
+
+// ============================================================
+//  4. LESLIE  (rotary speaker simulation, stereo out)
+//
+//  A real Leslie has two rotors: a horn (highs) and a drum (lows),
+//  each turning at its own speed. The sound at a fixed microphone
+//  is modulated in two ways:
+//    - amplitude: the speaker beam sweeps past the microphone
+//    - pitch (Doppler): the horn mouth moves towards / away from it
+//
+//  Model:
+//    input -> crossover (LESLIE_CROSSOVER_HZ, 12 dB/oct each side, sums flat)
+//      high band -> horn: short modulated delay (Doppler) + amplitude mod
+//      low band  -> drum: amplitude mod only (the drum's Doppler is negligible)
+//    Two "microphones" a quarter turn apart give the left / right outputs.
+//
+//  The low band is delayed by the horn's mean delay so the two bands stay
+//  aligned around the crossover (otherwise they partly cancel there).
+//
+//  Speed control: mode 0 = stop, 1 = slow (chorale), 2 = fast (tremolo).
+//  The rotor speeds approach their targets exponentially, with separate
+//  run-up / run-down time constants for horn and drum (config.h), so
+//  switching sweeps smoothly between speeds. After a stop the speeds fade
+//  below LESLIE_STOP_HZ, the effect is crossfaded to dry and then bypassed
+//  completely (no CPU, no colouration).
+//
+//  Cost: ~4 sine evaluations + a handful of multiplies per sample.
+//  Memory: 2 x 128 floats. Core 1 only; `mode` is written from core 0.
+// ============================================================
+struct Leslie {
+    volatile uint8_t mode = 0;   // 0 = stop, 1 = slow, 2 = fast
+
+    // Current rotor speeds in Hz (for display / debug; written by core 1)
+    float hornHz = 0.0f;
+    float drumHz = 0.0f;
+
+    // Map the CC27 value (three-position switch) onto a mode
+    void setSwitch(uint8_t ccValue) {
+        switch (midi_switch3(ccValue)) {
+            case 0:  mode = LESLIE_POS_LOW;  break;
+            case 1:  mode = LESLIE_POS_MID;  break;
+            default: mode = LESLIE_POS_HIGH; break;
+        }
+    }
+
+    Leslie() {
+        const float fs = (float)SAMPLE_RATE;
+        const float g = tanf(3.14159265f * LESLIE_CROSSOVER_HZ / fs);
+        _xoG      = g / (1.0f + g);
+        _hUp      = 1.0f / (LESLIE_HORN_ACCEL_S * fs);
+        _hDn      = 1.0f / (LESLIE_HORN_DECEL_S * fs);
+        _dUp      = 1.0f / (LESLIE_DRUM_ACCEL_S * fs);
+        _dDn      = 1.0f / (LESLIE_DRUM_DECEL_S * fs);
+        _wetSlew  = 1.0f / (0.4f * fs);
+        _dAmp     = LESLIE_HORN_DOPPLER_MS * fs / 1000.0f;   // samples
+        _dBase    = _dAmp + 1.0f;                            // keeps delay >= 1 sample
+        _lowDelay = (int)(_dBase + 0.5f);
+        _hg0      = 1.0f - 0.5f * LESLIE_HORN_DEPTH;   // gain = _g0 + _g1 * cos(angle)
+        _hg1      =        0.5f * LESLIE_HORN_DEPTH;
+        _dg0      = 1.0f - 0.5f * LESLIE_DRUM_DEPTH;
+        _dg1      =        0.5f * LESLIE_DRUM_DEPTH;
+        _drumPh   = 0.37f;   // start the rotors out of step
+    }
+
+    // in: mono sample (int16 range, int32 headroom). Returns stereo via outL/outR.
+    inline void process(int32_t in, int32_t& outL, int32_t& outR) {
+        // ---- rotor speeds: exponential approach (rotor inertia) -------
+        const uint8_t m = mode;
+        const float hT = (m == 1) ? LESLIE_HORN_SLOW_HZ : (m == 2) ? LESLIE_HORN_FAST_HZ : 0.0f;
+        const float dT = (m == 1) ? LESLIE_DRUM_SLOW_HZ : (m == 2) ? LESLIE_DRUM_FAST_HZ : 0.0f;
+        hornHz += (hT - hornHz) * (hT > hornHz ? _hUp : _hDn);
+        drumHz += (dT - drumHz) * (dT > drumHz ? _dUp : _dDn);
+
+        // ---- stopped and wound down: fade to dry, then bypass ----------
+        const bool spinning = (m != 0) || hornHz > LESLIE_STOP_HZ || drumHz > LESLIE_STOP_HZ;
+        _wet += ((spinning ? 1.0f : 0.0f) - _wet) * _wetSlew;
+        if (!spinning && _wet < 0.001f) {
+            _wet = 0.0f; hornHz = 0.0f; drumHz = 0.0f;
+            outL = outR = in;
+            return;
+        }
+
+        // ---- crossover: 12 dB/oct on both sides ---------------------------
+        // low  = H(H(x)),  high = -(1-H)(1-H)(x)  with H a one-pole lowpass.
+        // The high band is polarity-inverted so low + high is an allpass, i.e.
+        // flat. H uses the bilinear (TPT) form so that 1-H is an exact highpass
+        // and the sum is exactly flat. (A plain "high = x - low" would only be
+        // 6 dB/oct and let bass notes leak into the horn.)
+        const float x = (float)in;
+        float v;
+        v = (x - _s1) * _xoG;  const float lp1 = v + _s1;  _s1 = lp1 + v;     // H x
+        v = (lp1 - _s2) * _xoG; const float lp2 = v + _s2; _s2 = lp2 + v;     // H H x
+        const float h1 = x - lp1;                                              // (1-H) x
+        v = (h1 - _s3) * _xoG;  const float lp3 = v + _s3;  _s3 = lp3 + v;    // H (1-H) x
+        const float low  = lp2;
+        const float high = lp3 - h1;                                           // -(1-H)(1-H) x
+
+        _hbuf[_w & MASK] = high;
+        _lbuf[_w & MASK] = low;
+
+        // ---- rotor angles ----------------------------------------------
+        _hornPh += hornHz * (1.0f / (float)SAMPLE_RATE);
+        if (_hornPh >= 1.0f) _hornPh -= 1.0f;
+        _drumPh += drumHz * (1.0f / (float)SAMPLE_RATE);
+        if (_drumPh >= 1.0f) _drumPh -= 1.0f;
+
+        // cos(angle) as seen by the left and right microphone
+        const float cHL = _fx_sin(_hornPh + 0.25f);
+        const float cHR = _fx_sin(_hornPh + LESLIE_MIC_OFFSET + 0.25f);
+        const float cDL = _fx_sin(_drumPh + 0.25f);
+        const float cDR = _fx_sin(_drumPh + LESLIE_MIC_OFFSET + 0.25f);
+
+        // ---- horn: Doppler delay + amplitude ---------------------------
+        const float hL = _tap(_hbuf, _dBase - _dAmp * cHL) * (_hg0 + _hg1 * cHL);
+        const float hR = _tap(_hbuf, _dBase - _dAmp * cHR) * (_hg0 + _hg1 * cHR);
+
+        // ---- drum: amplitude only (delay-aligned with the horn) ---------
+        const float lo = _lbuf[(_w - _lowDelay) & MASK];
+        const float dL = lo * (_dg0 + _dg1 * cDL);
+        const float dR = lo * (_dg0 + _dg1 * cDR);
+        _w++;
+
+        float L = (hL + dL) * LESLIE_MAKEUP;
+        float R = (hR + dR) * LESLIE_MAKEUP;
+#if !LESLIE_STEREO
+        L = R = 0.5f * (L + R);
+#endif
+        const float dry = x * (1.0f - _wet);
+        outL = (int32_t)(dry + L * _wet);
+        outR = (int32_t)(dry + R * _wet);
+    }
+
+private:
+    static constexpr int BUF  = 128;
+    static constexpr int MASK = BUF - 1;
+    static_assert(2.0f * LESLIE_HORN_DOPPLER_MS * SAMPLE_RATE / 1000.0f + 3.0f < BUF,
+                  "LESLIE_HORN_DOPPLER_MS too large for the delay buffer");
+
+    float _hbuf[BUF] = {};
+    float _lbuf[BUF] = {};
+    int   _w = 0;
+
+    float _s1 = 0.0f, _s2 = 0.0f, _s3 = 0.0f;   // crossover filter states
+    float _hornPh = 0.0f, _drumPh = 0.0f;
+    float _wet = 0.0f;
+
+    float _xoG, _hUp, _hDn, _dUp, _dDn, _wetSlew;
+    float _dAmp, _dBase, _hg0, _hg1, _dg0, _dg1;
+    int   _lowDelay;
+
+    // Linear-interpolated read, d samples behind the newest sample
+    inline float _tap(const float* b, float d) const {
+        const int   i = (int)d;
+        const float f = d - (float)i;
+        const float s0 = b[(_w - i)     & MASK];
+        const float s1 = b[(_w - i - 1) & MASK];
+        return s0 + f * (s1 - s0);
     }
 };

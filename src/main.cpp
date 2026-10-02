@@ -75,23 +75,21 @@ void midi_pitch_bend(int16_t bend) {
 }
 
 void midi_cc(uint8_t cc, uint8_t value) {
+#if ENABLE_SERIAL
+    // Print ALL incoming CCs so unrecognised ones are visible
+    Serial.print("CC "); Serial.print(cc);
+    Serial.print("="); Serial.println(value);
+#endif
     if (cc == MIDI_CC_VOLUME) {
         organ.masterVolume = (uint8_t)((uint16_t)value * 255 / 127);
 #if ENABLE_LCD
         ui_mark_dirty_bottom();
-#endif
-#if ENABLE_SERIAL
-        Serial.print("Vol: "); Serial.println(value);
 #endif
         return;
     }
     if (organ.handleFxCC(cc, value)) {
 #if ENABLE_LCD
         ui_mark_dirty_bottom();
-#endif
-#if ENABLE_SERIAL
-        Serial.print("FX CC "); Serial.print(cc);
-        Serial.print("="); Serial.println(value);
 #endif
         return;
     }
@@ -100,10 +98,6 @@ void midi_cc(uint8_t cc, uint8_t value) {
         ui_mark_dirty_bars();
         ui_mark_dirty_bottom();
         ui_mark_dirty_top();
-#endif
-#if ENABLE_SERIAL
-        Serial.print("CC "); Serial.print(cc);
-        Serial.print("="); Serial.println(value);
 #endif
     }
 }
@@ -248,9 +242,10 @@ void __not_in_flash_func(loop1)() {
     uint32_t total_cycles = 0;
     for (int i = 0; i < BUFFER_FRAMES; i++) {
         uint32_t c0 = _DWT_CYCCNT;
-        int16_t s = organ.tick();
+        int16_t sl, sr;
+        organ.tick(sl, sr);
         total_cycles += _DWT_CYCCNT - c0;
-        audio_driver_put(s, s);
+        audio_driver_put(sl, sr);
     }
 
     // load% = compute_cycles / budget_cycles * 100
@@ -295,6 +290,8 @@ static void handleSerial() {
             Serial.println("  cho d <0-127>     — chorus depth (0=off)");
             Serial.println("  cho r <0-127>     — chorus rate");
             Serial.println("  cho m <0-127>     — chorus wet/dry mix");
+            Serial.println("  cho a <0-127>     — chorus amount (depth+mix together, like the pot)");
+            Serial.println("  les stop|slow|fast — Leslie speed (run-up/down applies)");
             Serial.println("  pio               — audio PIO state");
         } else if (line == "info") {
             organ.debugPrint();
@@ -349,6 +346,13 @@ static void handleSerial() {
           } else if (line.startsWith("cho m ")) {
             organ.chorus.mix = constrain(line.substring(6).toInt(), 0, 127);
             Serial.print("Chorus mix: "); Serial.println(organ.chorus.mix);
+          } else if (line.startsWith("cho a ")) {
+            int v = constrain(line.substring(6).toInt(), 0, 127);
+            organ.chorus.depth = v; organ.chorus.mix = v;
+            Serial.print("Chorus amount: "); Serial.println(v);
+          } else if (line == "les stop") { organ.leslie.mode = 0; Serial.println("Leslie: stop");
+          } else if (line == "les slow") { organ.leslie.mode = 1; Serial.println("Leslie: slow");
+          } else if (line == "les fast") { organ.leslie.mode = 2; Serial.println("Leslie: fast");
           } else {
             Serial.print("Unknown: "); Serial.println(line);
           }

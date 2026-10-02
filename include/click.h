@@ -6,7 +6,8 @@
 
 #include "config.h"
 
-#define CLICK_CC_LEVEL  MIDI_CC_CLICK
+#define CLICK_CC_LEVEL   MIDI_CC_CLICK
+#define CLICK_CC_SWITCH  MIDI_CC_CLICK_SWITCH
 
 // Decay: ~5ms burst. exp(-1/(0.005*44100)) ≈ 0.9955
 static const float CLICK_DECAY = 0.9955f;
@@ -19,6 +20,14 @@ public:
     void trigger() { if (level > 0) _env = 1.0f; }
 
     bool handleCC(uint8_t cc, uint8_t value) {
+        if (cc == CLICK_CC_SWITCH) {          // 0 = off, 1 = medium, 2 = high
+            switch (midi_switch3(value)) {
+                case 0:  level = 0;                 break;
+                case 1:  level = CLICK_LEVEL_MEDIUM; break;
+                default: level = CLICK_LEVEL_HIGH;   break;
+            }
+            return true;
+        }
         if (cc == CLICK_CC_LEVEL) {
             level = (uint8_t)((uint16_t)value * 255 / 127);
             return true;
